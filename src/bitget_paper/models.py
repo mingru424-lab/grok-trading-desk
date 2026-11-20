@@ -27,36 +27,45 @@ SIGNED_DEC = r"-?(0|[1-9][0-9]{0,17})(\.[0-9]{1,12})?"
 DEMO_CASH_BUFFER = Decimal("0.01")
 
 DISCLAIMER = (
-    "演示决策：确定性演示策略，不是 LLM 多 Agent 验证，不是收益预测，不代表任何预期回报。"
-    " DETERMINISTIC DEMO: not an LLM multi-agent verification and not a return forecast."
+    "纸面规则：由配置的本地策略给出买卖或持有，不是 LLM 多 Agent 验证，不是收益预测，不代表任何预期回报。"
+    " PAPER RULE: a configured local strategy, not an LLM multi-agent verification and not a return forecast."
 )
 ASSUMPTION_NOTE = (
     "演示假设：手续费和滑点不是 Bitget 手续费表，也不是交易所真实成交。"
     " Demonstration assumptions, not Bitget's fee schedule and not an exchange fill."
 )
-POLICY_ID = "deterministic_demo_flat_once_v1"
-POLICY_RULE = "if_flat_and_no_prior_fill_then_buy_demo_notional_else_hold"
+LEGACY_POLICY_ID = "deterministic_demo_flat_once_v1"
+SMA_POLICY_ID = "baseline_sma_cross_v1"
+POLICY_ID = SMA_POLICY_ID
+LEGACY_RULE = "if_flat_and_no_prior_fill_then_buy_demo_notional_else_hold"
+SMA_RULE = "fast_sma_above_slow_sma_buys_flat_book_fast_below_sells_long_book"
+POLICY_RULE = SMA_RULE
+CORRELATION_ID = r"[a-z0-9][a-z0-9_-]{7,63}"
 
 DECISION_SCHEMA = schema(
     {
-        "schema_version": enum("bitget_paper_decision.v1"),
-        "label": enum("DETERMINISTIC_DEMO"),
+        "schema_version": enum("bitget_paper_decision.v2"),
+        "label": enum("PAPER_RULE"),
         "not_llm": {"type": "boolean", "const": True},
         "not_multi_agent_verification": {"type": "boolean", "const": True},
         "not_a_return_forecast": {"type": "boolean", "const": True},
-        "action": enum("BUY", "HOLD", "NO_TRADE"),
+        "action": enum("BUY", "SELL", "HOLD", "NO_TRADE"),
         "symbol": enum("BTCUSDT"),
         "category": enum("SPOT"),
         "notional_usd": {"type": "string", "pattern": UNSIGNED_DEC},
-        "policy_id": enum(POLICY_ID),
+        "policy_id": enum(LEGACY_POLICY_ID, SMA_POLICY_ID),
+        "correlation_id": {"type": "string", "pattern": CORRELATION_ID},
         "reason": {"type": "string", "minLength": 1, "maxLength": 200},
         "basis": schema(
             {
                 "quote_accepted": {"type": "boolean"},
                 "position_quantity_btc": {"type": "string", "pattern": UNSIGNED_DEC},
                 "fill_count": {"type": "integer", "minimum": 0},
-                "price_used_as_signal": {"type": "boolean", "const": False},
-                "rule": enum(POLICY_RULE),
+                "price_used_as_signal": {"type": "boolean"},
+                "rule": enum(LEGACY_RULE, SMA_RULE),
+                "fast_sma": {"type": "string", "pattern": UNSIGNED_DEC},
+                "slow_sma": {"type": "string", "pattern": UNSIGNED_DEC},
+                "bar_ts_ms": {"type": "integer", "minimum": 0},
             }
         ),
         "disclaimer": {"type": "string", "const": DISCLAIMER},
@@ -210,8 +219,11 @@ class DecisionBasis(BaseModel):
     quote_accepted: bool
     position_quantity_btc: str
     fill_count: int = Field(ge=0)
-    price_used_as_signal: Literal[False]
-    rule: Literal[POLICY_RULE]
+    price_used_as_signal: bool
+    rule: Literal[LEGACY_RULE, SMA_RULE]
+    fast_sma: str = "0"
+    slow_sma: str = "0"
+    bar_ts_ms: int = Field(default=0, ge=0)
 
     @field_validator("position_quantity_btc")
     @classmethod
@@ -225,16 +237,17 @@ class DemoDecision(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["bitget_paper_decision.v1"]
-    label: Literal["DETERMINISTIC_DEMO"]
+    schema_version: Literal["bitget_paper_decision.v2"]
+    label: Literal["PAPER_RULE"]
     not_llm: Literal[True]
     not_multi_agent_verification: Literal[True]
     not_a_return_forecast: Literal[True]
-    action: Literal["BUY", "HOLD", "NO_TRADE"]
+    action: Literal["BUY", "SELL", "HOLD", "NO_TRADE"]
     symbol: Literal["BTCUSDT"]
     category: Literal["SPOT"]
     notional_usd: str
-    policy_id: Literal[POLICY_ID]
+    policy_id: Literal[LEGACY_POLICY_ID, SMA_POLICY_ID]
+    correlation_id: str
     reason: str = Field(min_length=1, max_length=200)
     basis: DecisionBasis
     disclaimer: Literal[DISCLAIMER]
@@ -248,10 +261,12 @@ class DemoDecision(BaseModel):
     @model_validator(mode="after")
     def _action_matches_notional(self) -> "DemoDecision":
         amount = Decimal(self.notional_usd)
-        if self.action == "BUY" and amount <= 0:
-            raise ValueError("buy_needs_notional")
-        if self.action != "BUY" and amount != 0:
-            raise ValueError("non_buy_must_be_zero_notional")
+        if self.action in {"BUY", "SELL"} and amount <= 0:
+            raise ValueError("order_needs_notional")
+        if self.action not in {"BUY", "SELL"} and amount != 0:
+            raise ValueError("non_order_must_be_zero_notional")
+        if re.fullmatch(CORRELATION_ID, self.correlation_id) is None:
+            raise ValueError("correlation_id")
         return self
 
     def checked(self) -> "DemoDecision":
@@ -300,12 +315,24 @@ class ValidatedQuote(BaseModel):
         return self
 
 
+class EquityPoint(BaseModel):
+    """One local mark. Not an exchange valuation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ts: str
+    equity_usd: str
+    cash_usd: str
+    realized_usd: str
+    unrealized_usd: str
+
+
 class PaperState(BaseModel):
     """The local book. A file that fails validation is left untouched."""
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[1]
+    version: Literal[2]
     label: Literal["LOCAL_PAPER_DEMO"]
     symbol: Literal["BTCUSDT"]
     category: Literal["SPOT"]
@@ -317,6 +344,13 @@ class PaperState(BaseModel):
     fill_count: int = Field(ge=0)
     last_mark_price: Decimal | None = None
     last_unrealized_pnl_usd: Decimal = Decimal("0")
+    peak_equity_usd: Decimal
+    applied_ids: list[str] = Field(default_factory=list)
+    last_bar_ms: int | None = None
+    last_action: Literal["NONE", "BUY", "SELL", "HOLD", "NO_TRADE"] = "NONE"
+    cycle_seq: int = Field(default=0, ge=0)
+    emergency_flattened: bool = False
+    equity_tail: list["EquityPoint"] = Field(default_factory=list)
     updated_at: datetime
 
     @field_validator(
@@ -324,6 +358,7 @@ class PaperState(BaseModel):
         "quantity_btc",
         "cost_basis_usd",
         "fees_paid_usd",
+        "peak_equity_usd",
         mode="before",
     )
     @classmethod
@@ -355,6 +390,12 @@ class PaperState(BaseModel):
             raise ValueError("open_book_must_have_cost")
         if not self.realized_pnl_usd.is_finite() or not self.last_unrealized_pnl_usd.is_finite():
             raise ValueError("pnl")
+        if not self.peak_equity_usd.is_finite() or self.peak_equity_usd <= 0:
+            raise ValueError("peak_equity")
+        if len(self.applied_ids) > 64 or len(self.equity_tail) > 120:
+            raise ValueError("history_cap")
+        if self.last_bar_ms is not None and self.last_bar_ms < 0:
+            raise ValueError("bar")
         return self
 
 
@@ -377,6 +418,7 @@ class SourceInfo(BaseModel):
     base_url: Literal["https://api.bitget.com"]
     instruments_path: Literal["/api/v3/market/instruments"]
     tickers_path: Literal["/api/v3/market/tickers"]
+    candles_path: Literal["/api/v3/market/candles"] = "/api/v3/market/candles"
     query_category: Literal["SPOT"]
     query_symbol: Literal["BTCUSDT"]
     instrument_request_time_ms: int
@@ -402,6 +444,7 @@ class FillEconomics(BaseModel):
     gross_usd: str
     fee_usd: str
     cash_debited_usd: str
+    cash_credited_usd: str = "0"
 
 
 class PositionSnapshot(BaseModel):
@@ -439,7 +482,7 @@ class PaperFillRecord(BaseModel):
     demo: Literal[True]
     symbol: Literal["BTCUSDT"]
     category: Literal["SPOT"]
-    side: Literal["BUY"]
+    side: Literal["BUY", "SELL"]
     decision: DemoDecision
     source: SourceInfo
     assumptions: Assumptions

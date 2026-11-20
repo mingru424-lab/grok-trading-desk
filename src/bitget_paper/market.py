@@ -24,7 +24,7 @@ from typing import Any
 
 import httpx
 
-from .config import ALLOWED_PATHS, PUBLIC_BASE_URL, BitgetPaperSettings
+from .config import ALLOWED_PATHS, CANDLES_PATH, PUBLIC_BASE_URL, BitgetPaperSettings
 from .models import QuoteRejected, ValidatedQuote, epoch_ms
 
 _API_DECIMAL = re.compile(r"(0|[1-9][0-9]{0,24})(\.[0-9]{1,18})?")
@@ -94,6 +94,44 @@ def _check_fresh(ms: int, now_ms: int, max_age_ms: int, skew_ms: int, field: str
         raise QuoteRejected(
             "stale_quote", {"field": field, "age_ms": age, "max_age_ms": max_age_ms}
         )
+
+
+class Candle:
+    """One public kline. Fields are the exchange's list order, not a signal."""
+
+    __slots__ = ("ts_ms", "open", "high", "low", "close", "volume")
+
+    def __init__(self, ts_ms: int, open_: Decimal, high: Decimal, low: Decimal, close: Decimal, volume: Decimal):
+        self.ts_ms = ts_ms
+        self.open = open_
+        self.high = high
+        self.low = low
+        self.close = close
+        self.volume = volume
+
+
+INTERVAL_MS = {"1m": 60_000}
+
+
+def _envelope_rows(status: int, text: str) -> tuple[list[Any], int]:
+    if status != 200:
+        raise QuoteRejected("http_status", {"status": status})
+    if len(text) > _MAX_BODY:
+        raise QuoteRejected("oversized_body")
+    try:
+        body = json.loads(text)
+    except json.JSONDecodeError:
+        raise QuoteRejected("malformed_body") from None
+    if not isinstance(body, dict):
+        raise QuoteRejected("malformed_body")
+    code = body.get("code")
+    if code != "00000":
+        shown = code if isinstance(code, str) else type(code).__name__
+        raise QuoteRejected("api_code", {"code": str(shown)[:32]})
+    rows = body.get("data")
+    if not isinstance(rows, list) or not rows:
+        raise QuoteRejected("empty_data")
+    return rows, _epoch_ms(body.get("requestTime"))
 
 
 def _envelope(status: int, text: str) -> tuple[dict[str, Any], int]:
@@ -208,6 +246,47 @@ def parse_public_book(
     return quote
 
 
+def parse_candles(status: int, text: str, now: datetime, settings: BitgetPaperSettings) -> list[Candle]:
+    """Closed 1m bars only. A forming bar is dropped. Gaps and stale bars do not trade."""
+    rows, request_time = _envelope_rows(status, text)
+    now_ms = epoch_ms(now)
+    interval = INTERVAL_MS[settings.candle_interval]
+    _check_fresh(
+        request_time,
+        now_ms,
+        settings.max_quote_age_seconds * 1000,
+        settings.clock_skew_seconds * 1000,
+        "candle_request_time",
+    )
+    parsed: list[Candle] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 6:
+            raise QuoteRejected("malformed_body")
+        ts = _epoch_ms(row[0])
+        open_ = _api_decimal(row[1], positive=True, reason="non_positive_price")
+        high = _api_decimal(row[2], positive=True, reason="non_positive_price")
+        low = _api_decimal(row[3], positive=True, reason="non_positive_price")
+        close = _api_decimal(row[4], positive=True, reason="non_positive_price")
+        volume = _api_decimal(row[5], positive=False, reason="bad_decimal")
+        if high < low or high < max(open_, close) or low > min(open_, close):
+            raise QuoteRejected("candle_range")
+        parsed.append(Candle(ts, open_, high, low, close, volume))
+    parsed.sort(key=lambda candle: candle.ts_ms)
+    closed = [candle for candle in parsed if candle.ts_ms + interval <= now_ms + settings.clock_skew_seconds * 1000]
+    if len(closed) < settings.slow_period:
+        raise QuoteRejected("insufficient_history", {"rows": len(closed), "need": settings.slow_period})
+    for older, newer in zip(closed, closed[1:]):
+        if newer.ts_ms - older.ts_ms != interval:
+            raise QuoteRejected("candle_gap")
+    latest = closed[-1]
+    age = now_ms - latest.ts_ms
+    if age > 2 * interval + settings.clock_skew_seconds * 1000:
+        raise QuoteRejected("stale_candles", {"age_ms": age})
+    if latest.ts_ms > now_ms + settings.clock_skew_seconds * 1000:
+        raise QuoteRejected("future_quote", {"field": "candle_ts"})
+    return closed
+
+
 class PublicMarketClient:
     """GET the two public endpoints. The header set is closed."""
 
@@ -223,7 +302,7 @@ class PublicMarketClient:
             response = await client.get(url, params=params, headers=headers)
             return response.status_code, response.text
 
-    async def _get(self, path: str) -> tuple[int, str]:
+    async def _get(self, path: str, extra: dict[str, str] | None = None) -> tuple[int, str]:
         if path not in ALLOWED_PATHS or self.settings.public_base_url != PUBLIC_BASE_URL:
             raise QuoteRejected("path_not_allowed")
         headers = dict(PUBLIC_HEADERS)
@@ -231,6 +310,10 @@ class PublicMarketClient:
             raise QuoteRejected("path_not_allowed")
         url = PUBLIC_BASE_URL + path
         params = {"category": "SPOT", "symbol": "BTCUSDT"}
+        for key, value in (extra or {}).items():
+            if key not in {"interval", "limit"}:
+                raise QuoteRejected("path_not_allowed")
+            params[key] = value
         try:
             status, text = await self._transport("GET", url, params, headers)
         except QuoteRejected:
@@ -252,3 +335,13 @@ class PublicMarketClient:
             now,
             self.settings,
         )
+
+    async def fetch_candles(self, now: datetime) -> list[Candle]:
+        if self.settings.candles_path != CANDLES_PATH:
+            raise QuoteRejected("path_not_allowed")
+        limit = str(self.settings.slow_period + 2)
+        status, text = await self._get(
+            self.settings.candles_path,
+            {"interval": self.settings.candle_interval, "limit": limit},
+        )
+        return parse_candles(status, text, now, self.settings)

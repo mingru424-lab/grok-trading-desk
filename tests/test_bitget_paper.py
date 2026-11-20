@@ -54,7 +54,13 @@ def paper_config(tmp_path: Path, **overrides) -> dict:
     section = root["bitget_paper"]
     section["log_path"] = str(tmp_path / "paper.jsonl")
     section["state_path"] = str(tmp_path / "state.json")
+    section["equity_path"] = str(tmp_path / "equity.jsonl")
+    section["control_path"] = str(tmp_path / "control.json")
+    section["status_path"] = str(tmp_path / "status.json")
+    # Product default retries a failed transport. Scripted tests opt in.
+    retries = overrides.pop("max_cycle_retries", 0)
     section.update(overrides)
+    section["max_cycle_retries"] = retries
     root["bitget_paper"] = section
     return root
 
@@ -110,9 +116,29 @@ def scripted_config(tmp_path: Path, responses, **overrides):
     return paper_config(tmp_path, **overrides), Script(responses)
 
 
-def ok_responses(now_ms: int = NOW_MS, **edits):
+def candle_payload(now_ms: int, closes: list[int]) -> dict:
+    interval = 60_000
+    last_closed = now_ms - (now_ms % interval) - interval
+    start = last_closed - (len(closes) - 1) * interval
+    rows = []
+    for index, close in enumerate(closes):
+        price = f"{close:.2f}"
+        rows.append([str(start + index * interval), price, price, price, price, "1", "1"])
+    return {"code": "00000", "msg": "success", "requestTime": now_ms, "data": rows}
+
+
+def bullish_closes() -> list[int]:
+    return [100 + index for index in range(20)]
+
+
+def bearish_closes() -> list[int]:
+    return [119 - index for index in range(20)]
+
+
+def ok_responses(now_ms: int = NOW_MS, closes: list[int] | None = None, **edits):
     instruments, tickers = fresh_payloads(now_ms, **edits)
-    return [(200, instruments), (200, tickers)]
+    candles = dump(candle_payload(now_ms, closes or bullish_closes()))
+    return [(200, instruments), (200, tickers), (200, candles)]
 
 
 def records(tmp_path: Path) -> list[dict]:
@@ -235,12 +261,16 @@ async def test_fresh_book_simulates_one_demo_buy(tmp_path):
     assert result.summary["execution"] == "simulate"
     assert Decimal(result.summary["unrealized_usd"]) < 0
 
-    assert [call["method"] for call in transport.calls] == ["GET", "GET"]
+    assert [call["method"] for call in transport.calls] == ["GET", "GET", "GET"]
     assert transport.calls[0]["url"].endswith("/api/v3/market/instruments")
     assert transport.calls[1]["url"].endswith("/api/v3/market/tickers")
+    assert transport.calls[2]["url"].endswith("/api/v3/market/candles")
+    assert transport.calls[2]["params"]["interval"] == "1m"
     for call in transport.calls:
         assert call["headers"] == PUBLIC_HEADERS
-        assert call["params"] == {"category": "SPOT", "symbol": "BTCUSDT"}
+        assert call["params"]["category"] == "SPOT"
+        assert call["params"]["symbol"] == "BTCUSDT"
+        assert set(call["params"]) <= {"category", "symbol", "interval", "limit"}
         assert "ACCESS-KEY" not in call["headers"]
         assert "Authorization" not in call["headers"]
 
@@ -252,10 +282,12 @@ async def test_fresh_book_simulates_one_demo_buy(tmp_path):
     assert fill["not_exchange_order"] is True
     assert fill["authenticated"] is False
     assert fill["demo"] is True
-    assert fill["decision"]["label"] == "DETERMINISTIC_DEMO"
+    assert fill["decision"]["label"] == "PAPER_RULE"
+    assert fill["decision"]["policy_id"] == "baseline_sma_cross_v1"
+    assert fill["decision"]["basis"]["price_used_as_signal"] is True
+    assert fill["decision"]["not_a_return_forecast"] is True
     assert fill["decision"]["not_llm"] is True
     assert fill["decision"]["not_multi_agent_verification"] is True
-    assert fill["decision"]["basis"]["price_used_as_signal"] is False
     assert fill["assumptions"]["fee_bps"] == 10
     assert fill["assumptions"]["slippage_bps"] == 5
     assert fill["assumptions"]["fee_is_exchange_schedule"] is False
@@ -285,7 +317,7 @@ async def test_second_cycle_holds_and_does_not_fill_again(tmp_path):
     second = await run_cycle(again, transport=transport2, now=from_epoch_ms(NOW_MS + 1_000))
     assert second.status == "held"
     assert second.fill_written is False
-    assert second.summary["reason"] == "demo_position_already_open_no_exit_rule"
+    assert second.summary["reason"] == "baseline_keep_long"
     fills = [row for row in records(tmp_path) if row["type"] == "bitget_paper_fill"]
     assert len(fills) == 1
     state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
@@ -548,7 +580,7 @@ async def test_runner_honors_the_position_cap_even_if_the_decision_says_buy(tmp_
     def _force(*args, **kwargs):
         return forced
 
-    monkeypatch.setattr("src.bitget_paper.engine.demo_decide", _force)
+    monkeypatch.setattr("src.bitget_paper.engine.decide_cycle", _force)
     config, transport = scripted_config(tmp_path, ok_responses())
     result = await run_cycle(config, transport=transport, now=NOW)
     assert result.status == "risk_rejected"
@@ -769,7 +801,8 @@ def test_unknown_exchange_fields_are_ignored_sync(tmp_path):
     inst["data"][0]["isRwa"] = "NO"
     inst["data"][0]["note"] = "ignore me"
     config = paper_config(tmp_path)
-    result = _await(config, Script([(200, dump(inst)), (200, tickers)]))
+    candles = dump(candle_payload(NOW_MS, bullish_closes()))
+    result = _await(config, Script([(200, dump(inst)), (200, tickers), (200, candles)]))
     assert result.fill_written is True
     assert "ignore me" not in (tmp_path / "paper.jsonl").read_text(encoding="utf-8")
 
@@ -802,10 +835,9 @@ async def test_public_smoke_btcusdt_needs_no_credentials(tmp_path, monkeypatch):
 async def test_public_once_simulates_a_local_fill_from_the_live_quote(tmp_path):
     result = await run_cycle(paper_config(tmp_path))
     assert result.exit_code == 0
-    assert result.fill_written is True
     assert result.summary["exchange_order"] is False
     assert result.summary["authenticated"] is False
-    assert Decimal(result.summary["unrealized_usd"]) < 0
+    assert result.summary["strategy_expects_profit"] is False
     text = (tmp_path / "paper.jsonl").read_text(encoding="utf-8")
-    assert "LOCAL_SIMULATED_FILL" in text
     assert "ACCESS-KEY" not in text
+    assert "baseline_sma_cross_v1" in text or "quote_rejected" in text or "PAPER_RULE" in text

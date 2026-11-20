@@ -12,8 +12,8 @@ from decimal import Decimal
 
 from .models import (
     DISCLAIMER,
-    POLICY_ID,
-    POLICY_RULE,
+    LEGACY_POLICY_ID,
+    LEGACY_RULE,
     DecisionBasis,
     DemoDecision,
     PaperState,
@@ -21,7 +21,16 @@ from .models import (
 )
 
 
-def demo_decide(state: PaperState, quote_accepted: bool, notional: Decimal) -> DemoDecision:
+def demo_decide(
+    state: PaperState,
+    quote_accepted: bool,
+    notional: Decimal,
+    correlation_id: str = "legacycheck",
+) -> DemoDecision:
+    """Previous one-shot rule. Kept so an operator can select it explicitly.
+
+    It is not the product default. Price is not an input.
+    """
     if not quote_accepted:
         action = "NO_TRADE"
         amount = Decimal("0")
@@ -35,8 +44,8 @@ def demo_decide(state: PaperState, quote_accepted: bool, notional: Decimal) -> D
         amount = notional
         reason = "demo_flat_book_one_shot_pipeline_check"
     decision = DemoDecision(
-        schema_version="bitget_paper_decision.v1",
-        label="DETERMINISTIC_DEMO",
+        schema_version="bitget_paper_decision.v2",
+        label="PAPER_RULE",
         not_llm=True,
         not_multi_agent_verification=True,
         not_a_return_forecast=True,
@@ -44,14 +53,18 @@ def demo_decide(state: PaperState, quote_accepted: bool, notional: Decimal) -> D
         symbol="BTCUSDT",
         category="SPOT",
         notional_usd=money_str(amount),
-        policy_id=POLICY_ID,
+        policy_id=LEGACY_POLICY_ID,
+        correlation_id=correlation_id,
         reason=reason,
         basis=DecisionBasis(
             quote_accepted=quote_accepted,
             position_quantity_btc=money_str(state.quantity_btc),
             fill_count=state.fill_count,
             price_used_as_signal=False,
-            rule=POLICY_RULE,
+            rule=LEGACY_RULE,
+            fast_sma="0",
+            slow_sma="0",
+            bar_ts_ms=0,
         ),
         disclaimer=DISCLAIMER,
     )
