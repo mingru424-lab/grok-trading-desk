@@ -19,3 +19,4 @@
 - 公开行情 `BITGET_PAPER_NETWORK=1 python3 -m pytest -q -m network tests/test_bitget_paper.py`：2 passed, 49 deselected。
 - 开发机 `--run --max-cycles 3` 退出码 0。随后同一本账 `--once` 在均线转向后本地平仓。样本见 `examples/runtime-2026-11-20.json`。
 - 状态页在 `127.0.0.1:8765` 返回 `PAPER ONLY`，并用本机 Chrome 无头模式截过运行中的页面。
+- 上述产品改动在提交 `69c2dd0`。
