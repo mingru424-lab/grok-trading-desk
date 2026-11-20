@@ -30,3 +30,16 @@
 - 仓库当时没有 GitHub Actions。已加 `.github/workflows/tests.yml`，只跑离线测试。文件进仓库不等于那次检查已经成功。
 - 重复保护原来只挡同一根 K 线的同一个方向。现改为一根已收盘 K 线最多一笔模拟成交。紧急平仓除外。
 - 账本先于 JSONL 落盘，不是事务。缺口用 `bitget_paper_audit_gap` 承认，不补造成交明细。
+
+## 2026-11-20 16:59 CST 验证
+
+验证的代码是 `6d57ea6d4414d1d5a706e294823d8e7ca9eca653`。当时 `git status --short` 为空。Python 3.12.3。命令 `python3 -m pytest -q -m "not network"`，UTC 2026-11-20 08:59:19，上海时间 16:59:19。结果 295 passed, 2 deselected，退出码 0。原文在 `examples/pytest-offline-6d57ea6.txt`。
+
+同一提交的 GitHub Actions：
+
+- push 成功：https://github.com/mingru424-lab/grok-trading-desk/actions/runs/44706952020
+- pull_request 成功：https://github.com/mingru424-lab/grok-trading-desk/actions/runs/44706952122
+
+这两次都跑在 `6d57ea6`。本条记录本身是之后的文档提交，会再触发一次检查；写下这条时还不能把那次新运行说成已经成功。
+
+公开行情没有被要求成交。`--smoke` 退出码 0，`authenticated` 为 false。`--run --max-cycles 2` 退出码 0。同一本账再 `--once` 是 `baseline_stay_flat`，`fill_count` 仍是 0。买卖回合只在标明为合成 K 线的离线测试里强制出现。
