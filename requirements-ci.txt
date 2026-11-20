@@ -1,0 +1,11 @@
+# Pinned for GitHub Actions. The ranges in requirements.txt stay the
+# project declaration. These are the versions the offline suite was run with.
+websockets==17.4
+httpx==0.28.1
+pydantic==2.14.3
+PyYAML==6.0.1
+solders==0.29.0
+solana==0.42.0
+alpaca-py==0.45.0
+pytest==9.2.0
+pytest-asyncio==1.5.0

@@ -145,3 +145,49 @@ logging:
   path: "logs/desk.jsonl"
   echo_stdout: true
   cost_report_every: 25   # log a spend snapshot every N model calls
+
+# Local BTCUSDT spot paper book. Public market data only.
+# This block never places a Bitget order and has no key fields.
+# Do not put API keys, secrets, or passphrases here.
+# Defaults are demonstration parameters, not a strategy and not a return target.
+# See docs/bitget_paper_zh.md.
+bitget_paper:
+  enabled: true
+  execution: "simulate"     # the only accepted value; anything else refuses to start
+  symbol: "BTCUSDT"         # the only symbol this build will simulate
+  category: "SPOT"
+  public_base_url: "https://api.bitget.com"
+  instruments_path: "/api/v3/market/instruments"
+  tickers_path: "/api/v3/market/tickers"
+  timeout_seconds: 10
+  max_quote_age_seconds: 15
+  clock_skew_seconds: 2
+  max_spread_ratio: "0.01"
+  max_last_deviation_ratio: "0.005"
+  # baseline_sma_cross_v1 uses closed 1m candles. It is a baseline rule, not a forecast.
+  # deterministic_demo_flat_once_v1 remains available and ignores price.
+  strategy: "baseline_sma_cross_v1"
+  fast_period: 5
+  slow_period: 20
+  candle_interval: "1m"
+  candles_path: "/api/v3/market/candles"
+  demo_notional_usd: "25.00"
+  demo_cash_usd: "100.00"
+  fee_bps: 10               # assumption, not Bitget's fee schedule
+  slippage_bps: 5           # assumption, applied against the touch
+  max_position_usd: "100.00"
+  max_loss_usd: "100.00"
+  max_drawdown_pct: "0.25"
+  poll_seconds: 20
+  max_cycle_retries: 2
+  retry_backoff_seconds: "0.5"
+  emergency_flatten: false  # emergency stop does not sell unless this is true
+  status_enabled: true
+  status_host: "127.0.0.1"
+  status_port: 8765
+  log_path: "logs/bitget_paper.jsonl"
+  state_path: "logs/bitget_paper_state.json"
+  equity_path: "logs/bitget_paper_equity.jsonl"
+  control_path: "logs/bitget_paper_control.json"
+  status_path: "logs/bitget_paper_status.json"
+  echo_log: false

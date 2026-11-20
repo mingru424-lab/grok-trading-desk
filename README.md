@@ -220,6 +220,22 @@ Run the tests — they never touch the network:
 pytest -v
 ```
 
+### Bitget BTCUSDT local paper
+
+Public spot quotes only, filled in a local simulator. This entry point does not
+start the desk, does not read a Bitget key, and refuses any execution value
+other than `simulate`. A bad `bitget_paper` block stops; it does not fall
+through into Alpaca or the Solana stub. The one-shot rule is a pipeline
+demonstration, not a forecast.
+
+Operator instructions, scope checklist, and the maintenance log are in Chinese:
+[docs/bitget_paper_zh.md](docs/bitget_paper_zh.md).
+
+```bash
+python -m src.bitget_paper --config config.yaml --smoke
+python -m src.bitget_paper --config config.yaml --once
+```
+
 ### Going live
 
 Paper trading is the default and stays the default unless **both** conditions hold:

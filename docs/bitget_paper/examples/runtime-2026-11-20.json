@@ -1,0 +1,42 @@
+{
+  "fixture_kind": "runtime_observation",
+  "realtime": false,
+  "tradable": false,
+  "note": "2026-11-20 Asia/Shanghai 记录的一次开发机观察。数字来自当时的公开行情和本地账本，不是收益证明，也不能当后续价格使用。",
+  "authenticated": false,
+  "exchange_order": false,
+  "commands": {
+    "offline_tests": "python3 -m pytest -q -m \"not network\"",
+    "offline_result": "291 passed, 2 deselected",
+    "network_tests": "BITGET_PAPER_NETWORK=1 python3 -m pytest -q -m network tests/test_bitget_paper.py",
+    "network_result": "2 passed, 49 deselected",
+    "bounded_run": "python3 -m src.bitget_paper --config <temp> --run --max-cycles 3",
+    "bounded_run_result": "exit 0, cycles 3, execution simulate"
+  },
+  "bounded_run_last_status": {
+    "banner": "PAPER ONLY",
+    "runtime": "stopped",
+    "strategy_id": "baseline_sma_cross_v1",
+    "feed_status": "ok",
+    "last_reason": "baseline_keep_long",
+    "fill_count_after_three_cycles": 1,
+    "quantity_btc": "0.000403",
+    "realized_usd": "0",
+    "unrealized_usd": "-0.07094057"
+  },
+  "later_continuation_once": {
+    "command": "python3 -m src.bitget_paper --config <same temp> --once",
+    "exit": 0,
+    "action": "SELL",
+    "reason": "baseline_fast_sma_below_slow_close",
+    "quantity_btc_after": "0",
+    "realized_usd": "-0.07310654",
+    "note": "同一本账稍后继续跑了一轮，均线转到下方后本地平仓。这笔亏损只说明手续费、滑点和这段公开价格，不是策略评估。"
+  },
+  "status_page": {
+    "url": "http://127.0.0.1:8765/",
+    "health_banner": "PAPER ONLY",
+    "health_authenticated": false,
+    "screenshot": "local Chrome headless captured the running page; not stored in git"
+  }
+}

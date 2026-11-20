@@ -168,6 +168,35 @@ now retrieves comparable past trades and injects their outcomes into the prompt.
 A bull/bear debate stage before each checker is the other borrowed mechanism; it
 is off by default (`debate.enabled`) because it doubles generator calls.
 
+## Bitget public spot (2026-11-19)
+
+Checked the UTA reality guide, the demo-trading REST page, the public
+instruments and tickers pages, and a live unauthenticated GET.
+
+* `GET https://api.bitget.com/api/v3/market/instruments?category=SPOT&symbol=BTCUSDT`
+  and `GET /api/v3/market/tickers?category=SPOT&symbol=BTCUSDT` both returned
+  `code: "00000"` with no API key. Prices and sizes are strings. `requestTime`
+  is an integer millisecond timestamp. Ticker `ts` is a 13-digit string.
+  `status` was `online`, `isReality` was `no`, `symbolType` and
+  `instrumentType` were `crypto`, `baseCoin`/`quoteCoin` were `BTC`/`USDT`.
+  Spot `minOrderQty` was `"0"` (no quantity floor in that payload);
+  `minOrderAmount` was `"1"`. The spot instrument object did not include a
+  maker or taker fee. `isRwa` was in an older doc example and absent live, so
+  the parser does not require it.
+* Demo trading (`paptrading: 1` plus a Demo API Key) is an authenticated
+  practice account. This tree does not call it and does not collect that key.
+* rToken order routing is out of scope. Instruments and tickers are the public
+  endpoints the reality guide says are reused; this build does not call
+  reality order, account, or transfer endpoints.
+* A quote older than the configured window, a non-`online` instrument, a
+  reality/stock token, or any non-`00000` / non-200 / disconnected response
+  is rejected and does not open a local fill. Fee and slippage numbers in the
+  paper book are labeled assumptions because the public spot payload has no
+  fee schedule.
+
+The live field set can gain keys. Unknown keys are ignored. A missing
+required key is a rejection, not a default.
+
 ## Sources
 
 - https://docs.x.ai/openapi.json
@@ -181,3 +210,7 @@ is off by default (`debate.enabled`) because it doubles generator calls.
 - https://docs.alpaca.markets/us/docs/fractional-trading
 - https://alpaca.markets/learn/how-to-fix-common-trading-api-errors-at-alpaca
 - https://arxiv.org/abs/2412.20138
+- https://www.bitget.com/docs/uta/reality-trading-guide
+- https://www.bitget.com/docs/uta/demo-trading/rest-api
+- https://www.bitget.com/legacy-docs/uta/public/Instruments
+- https://www.bitget.com/legacy-docs/uta/public/Tickers
