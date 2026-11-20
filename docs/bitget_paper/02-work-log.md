@@ -20,3 +20,13 @@
 - 开发机 `--run --max-cycles 3` 退出码 0。随后同一本账 `--once` 在均线转向后本地平仓。样本见 `examples/runtime-2026-11-20.json`。
 - 状态页在 `127.0.0.1:8765` 返回 `PAPER ONLY`，并用本机 Chrome 无头模式截过运行中的页面。
 - 上述产品改动在提交 `69c2dd0`。
+
+## 2026-11-20 审查
+
+对照当时的 HEAD `53a2221` 查了五条意见。验证数字记在下一条，不写进产生这些数字的提交里。
+
+- `fills_count` 不存在。`PaperState.fill_count` 是账本字段。broker、engine、decision、strategy 读的都是 `fill_count`。审查点名的行号也是 `fill_count`。这不能解释 `--once` / `--run` 会 AttributeError。291 个离线测试和当时的公开行情运行与这个结论一致。
+- 行情拒绝的摘要里没有现金和持仓。轮询把缺失字段写成空字符串，状态页上的账本会被擦掉。这是真问题，已改：拒绝时带上上一本账，并标 `book_stale` 和时间。
+- 仓库当时没有 GitHub Actions。已加 `.github/workflows/tests.yml`，只跑离线测试。文件进仓库不等于那次检查已经成功。
+- 重复保护原来只挡同一根 K 线的同一个方向。现改为一根已收盘 K 线最多一笔模拟成交。紧急平仓除外。
+- 账本先于 JSONL 落盘，不是事务。缺口用 `bitget_paper_audit_gap` 承认，不补造成交明细。

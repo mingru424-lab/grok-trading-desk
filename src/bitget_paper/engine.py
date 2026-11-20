@@ -228,6 +228,7 @@ async def run_cycle(
     stop_event: asyncio.Event | None = None,
     sleeper: Callable[[float], Awaitable[None]] | None = None,
     correlation_id: str | None = None,
+    after_commit: Callable[[str], None] | None = None,
 ) -> CycleResult:
     """Run one simulate cycle, or a read-only public smoke when ``smoke`` is set.
 
@@ -253,6 +254,7 @@ async def run_cycle(
             stop_event=stop_event,
             sleeper=sleeper or asyncio.sleep,
             correlation_id=correlation_id,
+            after_commit=after_commit,
         )
     finally:
         if lock is not None:
@@ -269,11 +271,14 @@ async def _run_locked(
     stop_event: asyncio.Event | None,
     sleeper: Callable[[float], Awaitable[None]],
     correlation_id: str | None,
+    after_commit: Callable[[str], None] | None,
 ) -> CycleResult:
     # A corrupt book must fail before any network call and before any log write
     # that could be mistaken for a new decision to trade.
     state_path = Path(settings.state_path)
     state = None if smoke else load_state(state_path, settings, clock)
+    if state is not None:
+        _reconcile_audit(settings, state)
     log = EventLog({"logging": {"path": settings.log_path, "echo_stdout": settings.echo_log}})
     desk_mode = str(config.get("mode", ""))
     correlation = correlation_id or _new_correlation(state)
@@ -318,6 +323,7 @@ async def _run_locked(
             "quote_rejected",
             exc.reason,
             3,
+            **_carried_book(state, clock, exc.reason),
             correlation_id=correlation,
             desk_mode_ignored=desk_mode,
         )
@@ -369,6 +375,7 @@ async def _run_locked(
                 "quote_rejected",
                 exc.reason,
                 3,
+                **_carried_book(state, clock, exc.reason),
                 correlation_id=correlation,
                 desk_mode_ignored=desk_mode,
             )
@@ -442,11 +449,13 @@ async def _run_locked(
             state, quote, settings, log, state_path, clock, mark_price, unrealized,
             decision, "shutdown", correlation, desk_mode,
         )
+    # One simulated fill per closed candle. The side does not matter: the same
+    # bar cannot buy and then sell. Emergency flatten is the operator exception.
     if (
         action in {"BUY", "SELL"}
         and decision.basis.bar_ts_ms
         and state.last_bar_ms == decision.basis.bar_ts_ms
-        and state.last_action == action
+        and decision.reason != "emergency_flatten"
     ):
         return _reject(
             state, quote, settings, log, state_path, clock, mark_price, unrealized,
@@ -477,7 +486,8 @@ async def _run_locked(
                 clock.isoformat(),
             )
         return _sell(
-            state, quote, settings, log, state_path, clock, decision, correlation, desk_mode, control.mode
+            state, quote, settings, log, state_path, clock, decision, correlation, desk_mode,
+            control.mode, after_commit,
         )
 
     gate = PaperRiskGate(settings.max_position_usd, settings.max_loss_usd)
@@ -517,12 +527,78 @@ async def _run_locked(
         )
 
     save_state(state_path, bought)
+    # The book is committed before the audit line. A crash here keeps the
+    # position and drops the fill row; the next cycle records the gap.
+    if after_commit is not None:
+        after_commit("buy")
     log.write("bitget_paper_fill", **record.model_dump(mode="json"), correlation_id=correlation)
     _write_mark(log, bought, quote, settings, mark_price, unrealized, correlation)
     _write_equity(settings, bought, unrealized, correlation)
     return _book_result(
         "filled", decision.reason, True, bought, unrealized, correlation, desk_mode, "BUY",
         epoch_ms(clock) - quote.ticker_ts_ms, clock.isoformat(),
+    )
+
+
+def _carried_book(state: PaperState | None, clock: datetime, reason: str) -> dict[str, Any]:
+    """Last committed book. The failed quote is not a new mark."""
+    body: dict[str, Any] = {
+        "book_stale": True,
+        "observed_at": clock.isoformat(),
+        "book_note": reason,
+    }
+    if state is None:
+        return body
+    unrealized = state.last_unrealized_pnl_usd
+    body.update(
+        {
+            "cash_usd": money_str(state.cash_usd),
+            "quantity_btc": money_str(state.quantity_btc),
+            "realized_usd": money_str(state.realized_pnl_usd, signed=True),
+            "unrealized_usd": money_str(unrealized, signed=True),
+            "equity_usd": money_str(equity_of(state, unrealized), signed=True),
+            "book_as_of": state.updated_at.isoformat(),
+            "equity_tail": [point.model_dump() for point in state.equity_tail],
+        }
+    )
+    return body
+
+
+def _reconcile_audit(settings: BitgetPaperSettings, state: PaperState) -> None:
+    """If the book committed a fill the log never received, say so once.
+
+    This does not rebuild the missing fill. The state file stays authoritative.
+    """
+    if not state.applied_ids:
+        return
+    latest = state.applied_ids[-1]
+    path = Path(settings.log_path)
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("correlation_id") != latest:
+                continue
+            if row.get("type") in {"bitget_paper_fill", "bitget_paper_audit_gap"}:
+                return
+    append_jsonl(
+        path,
+        {
+            "type": "bitget_paper_audit_gap",
+            "book": "bitget_local_paper",
+            "correlation_id": latest,
+            "book_authoritative": True,
+            "fill_count": state.fill_count,
+            "quantity_btc": money_str(state.quantity_btc),
+            "note": (
+                "state file was committed before the fill audit line; "
+                "this row does not reconstruct that fill"
+            ),
+        },
     )
 
 
@@ -666,7 +742,7 @@ def _reject(
     )
 
 
-def _sell(state, quote, settings, log, state_path, clock, decision, correlation, desk_mode, control_mode) -> CycleResult:
+def _sell(state, quote, settings, log, state_path, clock, decision, correlation, desk_mode, control_mode, after_commit) -> CycleResult:
     if state.quantity_btc <= 0:
         mark_price, unrealized = mark_position(state, quote, settings.fee_bps, settings.slippage_bps)
         return _reject(
@@ -690,6 +766,8 @@ def _sell(state, quote, settings, log, state_path, clock, decision, correlation,
             decision, exc.reason, correlation, desk_mode,
         )
     save_state(state_path, sold)
+    if after_commit is not None:
+        after_commit("sell")
     log.write("bitget_paper_fill", **record.model_dump(mode="json"), correlation_id=correlation)
     _write_mark(log, sold, quote, settings, mark_price, unrealized, correlation)
     _write_equity(settings, sold, unrealized, correlation)

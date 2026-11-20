@@ -295,6 +295,151 @@ def test_cli_control_does_not_trade(tmp_path, capsys):
     assert "control_written" in capsys.readouterr().out
 
 
+def test_the_position_counter_is_fill_count():
+    """Review claimed broker/engine/decision/strategy use fills_count. They do not."""
+    from src.bitget_paper.broker import simulate_buy
+    from src.bitget_paper.engine import fresh_state
+    from src.bitget_paper.config import settings_from_root
+    import src.bitget_paper.broker as broker
+    import src.bitget_paper.decision as decision
+    import src.bitget_paper.engine as engine
+    import src.bitget_paper.models as models
+    import src.bitget_paper.strategy as strategy
+    from tests.test_bitget_paper import simple_quote
+
+    for module in (broker, decision, engine, models, strategy):
+        assert "fills_count" not in Path(module.__file__).read_text(encoding="utf-8")
+    state = fresh_state(settings_from_root(paper_config(Path("/tmp"))), NOW)
+    assert not hasattr(state, "fills_count")
+    assert state.fill_count == 0
+    bought = simulate_buy(state, simple_quote(), Decimal("25"), 10, 5, NOW)
+    assert bought.fill_count == 1
+
+
+async def test_a_rejected_quote_does_not_blank_the_open_book(tmp_path):
+    from tests.test_bitget_paper import FIXTURE, Script, dump, freshen
+
+    config, transport = scripted_config(tmp_path, ok_responses(), status_enabled=False)
+    opened = await run_cycle(config, transport=transport, now=NOW)
+    assert opened.fill_written is True
+    qty = _state(tmp_path)["quantity_btc"]
+    cash = _state(tmp_path)["cash_usd"]
+    stale = NOW_MS - 60_000
+    rejected = await run_cycle(
+        config,
+        transport=Script(
+            [
+                (200, dump(freshen(FIXTURE["instruments_body"], stale))),
+                (200, dump(freshen(FIXTURE["tickers_body"], stale))),
+            ]
+        ),
+        now=NOW,
+    )
+    assert rejected.status == "quote_rejected"
+    assert rejected.fill_written is False
+    assert rejected.summary["book_stale"] is True
+    assert rejected.summary["quantity_btc"] == qty
+    assert rejected.summary["cash_usd"] == cash
+    assert rejected.summary["observed_at"]
+    assert _state(tmp_path)["quantity_btc"] == qty
+
+    async def instant(_seconds):
+        return None
+
+    await run_loop(
+        config,
+        transport=Script([(500, "down")]),
+        max_cycles=1,
+        sleep=instant,
+        now_fn=lambda: NOW,
+    )
+    status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert status["feed"]["status"] == "rejected"
+    assert status["feed"]["as_of"]
+    assert status["book"]["quantity_btc"] == qty
+    assert status["book"]["cash_usd"] == cash
+    assert status["book"]["stale"] is True
+    assert status["book"]["quantity_btc"] != ""
+
+
+async def test_the_same_closed_candle_cannot_buy_and_then_sell(tmp_path, monkeypatch):
+    from src.bitget_paper.models import DISCLAIMER, SMA_POLICY_ID, SMA_RULE, DecisionBasis, DemoDecision, money_str
+    import src.bitget_paper.engine as engine
+
+    config, transport = scripted_config(tmp_path, ok_responses())
+    opened = await run_cycle(config, transport=transport, now=NOW)
+    assert opened.fill_written is True
+    bar = _state(tmp_path)["last_bar_ms"]
+    qty = _state(tmp_path)["quantity_btc"]
+    assert bar
+
+    def force_sell(state, **kwargs):
+        return DemoDecision(
+            schema_version="bitget_paper_decision.v2",
+            label="PAPER_RULE",
+            not_llm=True,
+            not_multi_agent_verification=True,
+            not_a_return_forecast=True,
+            action="SELL",
+            symbol="BTCUSDT",
+            category="SPOT",
+            notional_usd=money_str(state.quantity_btc * Decimal("100")),
+            policy_id=SMA_POLICY_ID,
+            correlation_id=kwargs["correlation_id"],
+            reason="forced_same_bar_sell",
+            basis=DecisionBasis(
+                quote_accepted=True,
+                position_quantity_btc=money_str(state.quantity_btc),
+                fill_count=state.fill_count,
+                price_used_as_signal=True,
+                rule=SMA_RULE,
+                fast_sma="1",
+                slow_sma="2",
+                bar_ts_ms=bar,
+            ),
+            disclaimer=DISCLAIMER,
+        ).checked()
+
+    monkeypatch.setattr(engine, "decide_cycle", force_sell)
+    again, transport2 = scripted_config(tmp_path, ok_responses())
+    blocked = await run_cycle(again, transport=transport2, now=NOW)
+    assert blocked.reason == "duplicate_bar"
+    assert blocked.fill_written is False
+    assert _state(tmp_path)["quantity_btc"] == qty
+    assert _state(tmp_path)["fill_count"] == 1
+
+    from src.bitget_paper.strategy import decide_cycle as original
+
+    monkeypatch.setattr(engine, "decide_cycle", original)
+    restarted, transport3 = scripted_config(tmp_path, ok_responses())
+    held = await run_cycle(restarted, transport=transport3, now=NOW)
+    assert held.fill_written is False
+    assert _state(tmp_path)["fill_count"] == 1
+    assert _state(tmp_path)["quantity_btc"] == qty
+
+
+async def test_a_crash_between_state_and_the_audit_log_does_not_fill_again(tmp_path):
+    config, transport = scripted_config(tmp_path, ok_responses())
+
+    def crash(_side):
+        raise RuntimeError("crash after state commit")
+
+    with pytest.raises(RuntimeError, match="crash after state commit"):
+        await run_cycle(config, transport=transport, now=NOW, after_commit=crash)
+    assert _state(tmp_path)["fill_count"] == 1
+    assert _state(tmp_path)["applied_ids"]
+    first_log = (tmp_path / "paper.jsonl").read_text(encoding="utf-8")
+    assert "bitget_paper_fill" not in first_log
+
+    again, transport2 = scripted_config(tmp_path, ok_responses())
+    followed = await run_cycle(again, transport=transport2, now=NOW)
+    assert followed.fill_written is False
+    assert _state(tmp_path)["fill_count"] == 1
+    second_log = (tmp_path / "paper.jsonl").read_text(encoding="utf-8")
+    assert "bitget_paper_audit_gap" in second_log
+    assert "bitget_paper_fill" not in second_log
+
+
 async def test_stale_candles_do_not_fill(tmp_path):
     from tests.test_bitget_paper import Script, dump, freshen, FIXTURE
 

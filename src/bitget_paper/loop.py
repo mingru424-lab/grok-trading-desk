@@ -101,6 +101,7 @@ async def run_loop(
                 "status": "ok" if result.exit_code == 0 else "rejected",
                 "reason": result.reason,
                 "ticker_age_ms": result.summary.get("ticker_age_ms", ""),
+                "as_of": result.summary.get("observed_at") or result.summary.get("ts") or "",
             }
             published["last_decision"] = {
                 "action": result.summary.get("action", ""),
@@ -111,14 +112,9 @@ async def run_loop(
             recent = list(published["recent_decisions"])
             recent.append(published["last_decision"])
             published["recent_decisions"] = recent[-20:]
-            published["book"] = {
-                "cash_usd": result.summary.get("cash_usd", ""),
-                "quantity_btc": result.summary.get("quantity_btc", ""),
-                "realized_usd": result.summary.get("realized_usd", ""),
-                "unrealized_usd": result.summary.get("unrealized_usd", ""),
-                "equity_usd": result.summary.get("equity_usd", ""),
-            }
-            published["equity"] = result.summary.get("equity_tail", [])
+            _keep_book(published, result.summary)
+            if result.summary.get("equity_tail"):
+                published["equity"] = result.summary["equity_tail"]
             write_json(Path(settings.status_path), published)
             completed += 1
             if stop_event is not None and stop_event.is_set():
@@ -135,6 +131,28 @@ async def run_loop(
         if server is not None:
             server.stop()
         lock.release()
+
+
+def _keep_book(published: dict[str, Any], summary: dict[str, Any]) -> None:
+    """A rejected quote must not replace a known book with blanks."""
+    cash = summary.get("cash_usd", "")
+    quantity = summary.get("quantity_btc", "")
+    has_numbers = cash != "" and quantity != ""
+    stale = bool(summary.get("book_stale")) or summary.get("status") == "quote_rejected"
+    if has_numbers:
+        published["book"] = {
+            "cash_usd": cash,
+            "quantity_btc": quantity,
+            "realized_usd": summary.get("realized_usd", ""),
+            "unrealized_usd": summary.get("unrealized_usd", ""),
+            "equity_usd": summary.get("equity_usd", ""),
+            "stale": stale,
+            "as_of": summary.get("book_as_of") or summary.get("observed_at") or summary.get("ts") or "",
+        }
+        return
+    if published.get("book"):
+        published["book"]["stale"] = True
+        published["book"]["as_of"] = summary.get("observed_at") or published["book"].get("as_of", "")
 
 
 async def _wait(pause: SleepFn, seconds: float, stop_event: asyncio.Event | None) -> bool:
