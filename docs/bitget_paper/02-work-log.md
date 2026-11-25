@@ -51,3 +51,13 @@
 - 每轮摘要额外带上当时已经算出的最新价、标记价和快慢均线，给页面显示。买卖、持仓、风控和账本迁移的规则没有改。
 - 云端开发机 Python 3.12.3。写下这条之前跑了 `/tmp/paper-venv/bin/python -m pytest -q -m "not network"`，2026-11-25 07:56 UTC，296 passed，2 deselected。这不是用户 Mac 上的结果。
 - 同一台云端机器用临时目录跑了公开行情 `--run --max-cycles 2`。结束时是 HOLD、`baseline_stay_flat`、持仓 0。运行中截图看到的价格是当时的公开行情，不是策略成绩。没有连接或替换 `/Users/ming/Documents/qianduoduo-paper-run`。
+
+## 2026-11-25 实时行情
+
+- 增加公开 WebSocket `wss://ws.bitget.com/v3/ws/public`，只订阅 BTCUSDT 现货 ticker。心跳是文本 `ping` / `pong`。合约资料、已收盘 1 分钟 K 线、以及过期后的备用 ticker 仍是公开 REST。对时用 `GET /api/v3/market/time` 的 `data.serverTime`。
+- 买卖规则没改。仍是已收盘均线，轮询间隔仍是 `poll_seconds`。同一根 K 线的去重和账本锁还在。行情变快不会让策略每一跳都成交。
+- 旧配置没有 `public_ws_enabled` 时默认打开这条公开流，不改现金、风险限额、策略和紧急平仓开关。写成 false 才回到纯 REST。
+- 原理写在 `08-realtime.md`。接收时间减服务端 `ts` 不是单程延迟。样本不够不报分位数。
+- 云端 Python 3.12.3，`/tmp/paper-venv/bin/python -m pytest -q -m "not network"`，2026-11-25 约 08:38 UTC，307 passed，2 deselected。这不是用户 Mac。
+- 同一台云端机器做了 90 秒公开流诊断，不写账本：有效消息 298，重连 0，心跳正常。时钟偏差估计 +65 ms，往返 325 ms，不确定度 ±162 ms，所以记为落在不确定度内。30 个相邻间隔里最近 304 ms、最小 234 ms、最大 404 ms。结束时 REST 最新价和流上最新价都是 59327.08，只用来对照，没有要求成交。
+- 为了截状态页，临时目录里的空账本按均线买过一次。那不是 `/Users/ming/Documents/qianduoduo-paper-run`，也没有连那台 Mac。

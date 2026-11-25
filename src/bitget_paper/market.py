@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 import httpx
 
-from .config import ALLOWED_PATHS, CANDLES_PATH, PUBLIC_BASE_URL, BitgetPaperSettings
+from .config import ALLOWED_PATHS, CANDLES_PATH, PUBLIC_BASE_URL, TIME_PATH, BitgetPaperSettings
 from .models import QuoteRejected, ValidatedQuote, epoch_ms
 
 _API_DECIMAL = re.compile(r"(0|[1-9][0-9]{0,24})(\.[0-9]{1,18})?")
@@ -111,6 +112,35 @@ class Candle:
 
 
 INTERVAL_MS = {"1m": 60_000}
+
+
+@dataclass(frozen=True)
+class TickerSnap:
+    """One accepted public ticker. Prices are already decimals; time is the server message ts."""
+
+    bid: Decimal
+    ask: Decimal
+    last: Decimal
+    bid_size: Decimal
+    ask_size: Decimal
+    server_ts_ms: int
+    received_at_ms: int
+
+
+@dataclass(frozen=True)
+class ClockSample:
+    """REST serverTime compared with the local clock around that call.
+
+    offset_ms is serverTime minus the local midpoint. It is not one-way delay.
+    uncertainty_ms is half the round trip. A negative offset is kept.
+    """
+
+    status: str
+    offset_ms: int | None
+    rtt_ms: int | None
+    uncertainty_ms: int | None
+    server_time_ms: int | None
+    sampled_at_ms: int | None
 
 
 def _envelope_rows(status: int, text: str) -> tuple[list[Any], int]:
@@ -238,12 +268,96 @@ def parse_public_book(
             ),
             max_market_order_amount=_optional_cap(instrument.get("maxMarketOrderAmount")),
             min_order_qty=_optional_cap(instrument.get("minOrderQty")),
+            source="bitget_public_rest_v3",
         )
     except QuoteRejected:
         raise
     except Exception as exc:  # noqa: BLE001 - model backstop, no payload in the reason
         raise QuoteRejected("quote_invalid", {"error_type": type(exc).__name__}) from exc
     return quote
+
+
+def parse_server_time(status: int, text: str) -> int:
+    """``GET /api/v3/market/time`` body field ``data.serverTime``, a millisecond string."""
+    if status != 200:
+        raise QuoteRejected("http_status", {"status": status})
+    if len(text) > _MAX_BODY:
+        raise QuoteRejected("oversized_body")
+    try:
+        body = json.loads(text)
+    except json.JSONDecodeError:
+        raise QuoteRejected("malformed_body") from None
+    if not isinstance(body, dict) or body.get("code") != "00000":
+        raise QuoteRejected("api_code")
+    data = body.get("data")
+    if not isinstance(data, dict):
+        raise QuoteRejected("malformed_body")
+    return _epoch_ms(data.get("serverTime"))
+
+
+def clock_sample_from_rtt(before_ms: int, after_ms: int, server_ms: int) -> ClockSample:
+    rtt = after_ms - before_ms
+    if rtt < 0:
+        return ClockSample("failed", None, None, None, server_ms, after_ms)
+    midpoint = before_ms + rtt // 2
+    return ClockSample(
+        status="ok",
+        offset_ms=server_ms - midpoint,
+        rtt_ms=rtt,
+        uncertainty_ms=rtt // 2,
+        server_time_ms=server_ms,
+        sampled_at_ms=after_ms,
+    )
+
+
+def judge_clock(sample: ClockSample, settings: BitgetPaperSettings) -> str:
+    """Name the sample. ``shifted`` is large enough to see past the round trip and the allowed skew."""
+    if sample.offset_ms is None or sample.uncertainty_ms is None or sample.rtt_ms is None:
+        return "failed"
+    if abs(sample.offset_ms) <= sample.uncertainty_ms:
+        return "within_noise"
+    allowance = settings.clock_skew_seconds * 1000 + sample.uncertainty_ms
+    if abs(sample.offset_ms) > allowance:
+        return "shifted"
+    return "ok"
+
+
+def assemble_ws_quote(
+    instrument_status: int,
+    instrument_text: str,
+    snap: TickerSnap,
+    now: datetime,
+    settings: BitgetPaperSettings,
+) -> ValidatedQuote:
+    """REST instrument metadata plus one WebSocket ticker snapshot.
+
+    The ticker clock is the message ``ts``, not a REST ``requestTime``.
+    Freshness uses the same age and future limits as the REST book.
+    """
+    now_ms = epoch_ms(now)
+    max_age_ms = settings.max_quote_age_seconds * 1000
+    skew_ms = settings.clock_skew_seconds * 1000
+    instrument, instrument_time = _envelope(instrument_status, instrument_text)
+    _check_fresh(instrument_time, now_ms, max_age_ms, skew_ms, "instrument_request_time")
+    _check_fresh(snap.server_ts_ms, now_ms, max_age_ms, skew_ms, "ticker_ts")
+    if instrument.get("symbol") != "BTCUSDT" or instrument.get("category") != "SPOT":
+        raise QuoteRejected("symbol_mismatch")
+    ticker = {
+        "symbol": "BTCUSDT",
+        "category": "SPOT",
+        "bid1Price": format(snap.bid, "f"),
+        "ask1Price": format(snap.ask, "f"),
+        "lastPrice": format(snap.last, "f"),
+        "bid1Size": format(snap.bid_size, "f"),
+        "ask1Size": format(snap.ask_size, "f"),
+        "ts": str(snap.server_ts_ms),
+    }
+    # Reuse the REST price checks. requestTime for this ticker is the message ts.
+    fake_ticker = json.dumps(
+        {"code": "00000", "msg": "success", "requestTime": snap.server_ts_ms, "data": [ticker]}
+    )
+    quote = parse_public_book(instrument_status, instrument_text, 200, fake_ticker, now, settings)
+    return quote.model_copy(update={"source": "bitget_public_ws_v3", "ticker_request_time_ms": snap.server_ts_ms})
 
 
 def parse_candles(status: int, text: str, now: datetime, settings: BitgetPaperSettings) -> list[Candle]:
@@ -309,7 +423,7 @@ class PublicMarketClient:
         if set(headers) != {"Accept", "User-Agent"}:
             raise QuoteRejected("path_not_allowed")
         url = PUBLIC_BASE_URL + path
-        params = {"category": "SPOT", "symbol": "BTCUSDT"}
+        params = {} if path == TIME_PATH else {"category": "SPOT", "symbol": "BTCUSDT"}
         for key, value in (extra or {}).items():
             if key not in {"interval", "limit"}:
                 raise QuoteRejected("path_not_allowed")
@@ -323,6 +437,36 @@ class PublicMarketClient:
         if not isinstance(status, int) or isinstance(status, bool) or not isinstance(text, str):
             raise QuoteRejected("transport_error", {"error_type": "BadTransportResult"})
         return status, text
+
+    async def measure_clock(self) -> ClockSample:
+        before = epoch_ms(datetime.now(timezone.utc))
+        status, text = await self._get(TIME_PATH)
+        after = epoch_ms(datetime.now(timezone.utc))
+        server_ms = parse_server_time(status, text)
+        sample = clock_sample_from_rtt(before, after, server_ms)
+        sample = ClockSample(
+            status=judge_clock(sample, self.settings),
+            offset_ms=sample.offset_ms,
+            rtt_ms=sample.rtt_ms,
+            uncertainty_ms=sample.uncertainty_ms,
+            server_time_ms=sample.server_time_ms,
+            sampled_at_ms=sample.sampled_at_ms,
+        )
+        return sample
+
+    async def fetch_cycle(self, now: datetime, snap: TickerSnap | None) -> tuple[ValidatedQuote, str]:
+        """Prefer a fresh WebSocket snap. REST is the labeled fallback and uses the same age limit."""
+        if snap is not None:
+            instrument_status, instrument_text = await self._get(self.settings.instruments_path)
+            try:
+                return assemble_ws_quote(instrument_status, instrument_text, snap, now, self.settings), ""
+            except QuoteRejected as exc:
+                if exc.reason in {"transport_error", "http_status"}:
+                    raise
+                quote = await self.fetch(now)
+                return quote, exc.reason
+        quote = await self.fetch(now)
+        return quote, "no_snapshot"
 
     async def fetch(self, now: datetime) -> ValidatedQuote:
         instrument_status, instrument_text = await self._get(self.settings.instruments_path)

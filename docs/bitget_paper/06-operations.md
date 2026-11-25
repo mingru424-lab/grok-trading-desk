@@ -47,7 +47,29 @@ cp logs/bitget_paper_equity.jsonl logs/bitget_paper_equity.jsonl.bak
 
 账本比 JSONL 先落盘。如果进程在两者之间停掉，持仓以账本为准，日志里可能少一行成交。下次启动会追加 `bitget_paper_audit_gap`，里面没有被补造的成交明细。不要把 JSONL 当成和账本同一事务的完整凭证。
 
+## 只读看一段公开行情
+
+不写账本、不模拟成交。时间限制在 10 到 120 秒。把配置换成你自己的绝对路径，不要用示例配置覆盖它：
+
+```bash
+python -m src.bitget_paper --config /Users/ming/Documents/qianduoduo-paper-run/config.yaml --ws-diagnose --seconds 90
+```
+
+输出里的 `fill_written` 应为 false。`arrival_minus_server_ms` 不是单程延迟。
+
 ## 更新已经在跑的目录
+
+实时行情是代码更新。旧配置没有 `public_ws_enabled` 时默认会连公开行情，但不会改写现金、风险限额、策略和紧急平仓开关。若要维持纯 REST，只在原配置里加上 `public_ws_enabled: false`。
+
+停机前先备份账本，路径按你机器上的实际文件，不要猜：
+
+```bash
+cp /Users/ming/Documents/qianduoduo-paper-run/logs/bitget_paper_state.json /Users/ming/Documents/qianduoduo-paper-run/logs/bitget_paper_state.json.bak
+cp /Users/ming/Documents/qianduoduo-paper-run/logs/bitget_paper.jsonl /Users/ming/Documents/qianduoduo-paper-run/logs/bitget_paper.jsonl.bak
+cp /Users/ming/Documents/qianduoduo-paper-run/logs/bitget_paper_equity.jsonl /Users/ming/Documents/qianduoduo-paper-run/logs/bitget_paper_equity.jsonl.bak
+```
+
+确认旧进程已经退出，再用原来的配置启动。不要把仓库里的 `config.example.yaml` 拷进去。回滚代码时，账本文件留在原地；不要用空账本覆盖有持仓的 `state.json`。
 
 代码更新只替换程序。运行目录里的 `config.yaml`、账本、JSONL、权益文件和控制文件都留在原地。不要把仓库里的 `config.example.yaml` 拷进去盖掉现有配置，也不要删除 `logs/`。
 

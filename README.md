@@ -228,7 +228,9 @@ other than `simulate`. A bad `bitget_paper` block stops; it does not fall
 through into Alpaca or the Solana stub. The one-shot rule is a pipeline
 demonstration, not a forecast.
 
-The local status page is named 钱多多. Operator instructions, scope checklist,
+The local status page is named 钱多多. A public BTCUSDT spot ticker stream
+updates that page; closed 1-minute candles still decide the paper trades.
+Operator instructions, scope checklist,
 and the maintenance log are in Chinese:
 [docs/bitget_paper_zh.md](docs/bitget_paper_zh.md).
 

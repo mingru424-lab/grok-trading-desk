@@ -191,3 +191,9 @@ bitget_paper:
   control_path: "logs/bitget_paper_control.json"
   status_path: "logs/bitget_paper_status.json"
   echo_log: false
+  # Missing public_ws_enabled means true. Turning it on does not reset cash, risk, or strategy.
+  public_ws_enabled: true
+  ws_ping_seconds: 30
+  ws_pong_timeout_seconds: 10
+  ws_reconnect_max_seconds: 30
+  clock_sync_seconds: 60

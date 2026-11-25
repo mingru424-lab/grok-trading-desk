@@ -229,6 +229,7 @@ async def run_cycle(
     sleeper: Callable[[float], Awaitable[None]] | None = None,
     correlation_id: str | None = None,
     after_commit: Callable[[str], None] | None = None,
+    ticker_feed=None,
 ) -> CycleResult:
     """Run one simulate cycle, or a read-only public smoke when ``smoke`` is set.
 
@@ -255,6 +256,7 @@ async def run_cycle(
             sleeper=sleeper or asyncio.sleep,
             correlation_id=correlation_id,
             after_commit=after_commit,
+            ticker_feed=ticker_feed,
         )
     finally:
         if lock is not None:
@@ -272,6 +274,7 @@ async def _run_locked(
     sleeper: Callable[[float], Awaitable[None]],
     correlation_id: str | None,
     after_commit: Callable[[str], None] | None,
+    ticker_feed=None,
 ) -> CycleResult:
     # A corrupt book must fail before any network call and before any log write
     # that could be mistaken for a new decision to trade.
@@ -284,8 +287,18 @@ async def _run_locked(
     correlation = correlation_id or _new_correlation(state)
     client = PublicMarketClient(settings, transport=transport)
     try:
-        quote = await _fetch_with_retry(client, clock, settings, sleeper)
+        if ticker_feed is not None and settings.public_ws_enabled and ticker_feed.clock_blocks_trading():
+            raise QuoteRejected("clock_anomaly")
+        if ticker_feed is not None and settings.public_ws_enabled:
+            quote, ws_note = await _fetch_cycle_with_retry(
+                client, clock, settings, sleeper, ticker_feed.latest
+            )
+            ticker_feed.note_trade(quote.source, ws_note)
+        else:
+            quote = await _fetch_with_retry(client, clock, settings, sleeper)
     except QuoteRejected as exc:
+        if ticker_feed is not None:
+            ticker_feed.note_trade("none", exc.reason)
         log.write(
             "bitget_paper_quote_rejected",
             book="bitget_local_paper",
@@ -619,6 +632,21 @@ def _retryable(exc: QuoteRejected) -> bool:
     return False
 
 
+async def _fetch_cycle_with_retry(client: PublicMarketClient, clock: datetime, settings: BitgetPaperSettings, sleeper, snap_fn):
+    attempts = settings.max_cycle_retries + 1
+    last: QuoteRejected | None = None
+    for attempt in range(attempts):
+        try:
+            return await client.fetch_cycle(clock, snap_fn())
+        except QuoteRejected as exc:
+            last = exc
+            if not _retryable(exc) or attempt + 1 >= attempts:
+                raise
+            await sleeper(float(settings.retry_backoff_seconds) * (2 ** attempt))
+    assert last is not None
+    raise last
+
+
 async def _fetch_with_retry(client: PublicMarketClient, clock: datetime, settings: BitgetPaperSettings, sleeper) -> ValidatedQuote:
     attempts = settings.max_cycle_retries + 1
     last: QuoteRejected | None = None
@@ -729,6 +757,7 @@ def _book_result(
         equity_usd=money_str(equity, signed=True),
         equity_tail=[point.model_dump() for point in state.equity_tail],
         desk_mode_ignored=desk_mode,
+        quote_source=quote.source if quote is not None else "",
         **extra,
     )
 

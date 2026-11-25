@@ -27,7 +27,9 @@ PUBLIC_BASE_URL = "https://api.bitget.com"
 INSTRUMENTS_PATH = "/api/v3/market/instruments"
 TICKERS_PATH = "/api/v3/market/tickers"
 CANDLES_PATH = "/api/v3/market/candles"
-ALLOWED_PATHS = frozenset({INSTRUMENTS_PATH, TICKERS_PATH, CANDLES_PATH})
+TIME_PATH = "/api/v3/market/time"
+PUBLIC_WS_URL = "wss://ws.bitget.com/v3/ws/public"
+ALLOWED_PATHS = frozenset({INSTRUMENTS_PATH, TICKERS_PATH, CANDLES_PATH, TIME_PATH})
 
 # Key names only. Values are never copied into the error text.
 _FORBIDDEN_KEY_PARTS = (
@@ -142,6 +144,12 @@ class BitgetPaperSettings(BaseModel):
     control_path: str = "logs/bitget_paper_control.json"
     status_path: str = "logs/bitget_paper_status.json"
     echo_log: bool = False
+    # Absent in an older file means on. It does not rewrite cash, risk, or strategy.
+    public_ws_enabled: bool = True
+    ws_ping_seconds: int = Field(default=30, ge=5, le=60)
+    ws_pong_timeout_seconds: int = Field(default=10, ge=2, le=30)
+    ws_reconnect_max_seconds: int = Field(default=30, ge=1, le=120)
+    clock_sync_seconds: int = Field(default=60, ge=15, le=600)
 
     @field_validator(
         "demo_notional_usd",
@@ -211,6 +219,8 @@ class BitgetPaperSettings(BaseModel):
             raise ValueError("demo_notional_exceeds_max_loss")
         if self.execution != "simulate":
             raise ValueError("execution_not_simulate")
+        if self.ws_pong_timeout_seconds >= self.ws_ping_seconds:
+            raise ValueError("pong_timeout_must_be_shorter_than_ping")
         return self
 
 

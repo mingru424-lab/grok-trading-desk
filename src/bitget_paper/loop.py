@@ -8,11 +8,16 @@ this loop publishes.
 from __future__ import annotations
 
 import asyncio
+import copy
+import threading
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from .config import settings_from_root
 from .engine import run_cycle
+from .market import PublicMarketClient
+from .models import QuoteRejected, epoch_ms
+from .public_ws import PublicTickerFeed
 from .status_server import StatusServer
 from .store import BookLock, lock_path_for, read_control, write_json
 from pathlib import Path
@@ -49,8 +54,8 @@ async def run_loop(
     settings = settings_from_root(config)
     pause = sleep or asyncio.sleep
     clock = now_fn or (lambda: datetime.now(timezone.utc))
-    lock = BookLock(lock_path_for(Path(settings.state_path)))
-    lock.acquire()
+    book_lock = BookLock(lock_path_for(Path(settings.state_path)))
+    book_lock.acquire()
     published: dict[str, Any] = _snapshot(
         {
             "runtime": "starting",
@@ -77,57 +82,106 @@ async def run_loop(
     )
     server = None
     results: list[dict[str, Any]] = []
+    feed: PublicTickerFeed | None = None
+    feed_task: asyncio.Task | None = None
+    clock_task: asyncio.Task | None = None
+    lock = threading.Lock()
+    own_stop = stop_event or asyncio.Event()
     try:
+        if settings.public_ws_enabled and transport is None:
+            feed = PublicTickerFeed(settings, now_fn=clock)
+            published["market"] = feed.view()
+            feed_task = asyncio.create_task(feed.run(own_stop))
+            clock_task = asyncio.create_task(_clock_sync(feed, settings, own_stop, pause))
+        else:
+            published["market"] = {
+                "enabled": settings.public_ws_enabled,
+                "connection": "disabled" if not settings.public_ws_enabled else "not_started",
+                "subscription": "none",
+                "heartbeat": "idle",
+                "trade_source": "bitget_public_rest_v3",
+                "trade_note": "ws_disabled" if not settings.public_ws_enabled else "injected_transport",
+            }
         if settings.status_enabled:
-            server = StatusServer(settings.status_host, settings.status_port, lambda: dict(published))
+            server = StatusServer(
+                settings.status_host,
+                settings.status_port,
+                lambda: _copy_status(published, lock, feed),
+            )
             server.start()
             published["status_port"] = server.bound_port
         published["runtime"] = "running"
+        if feed is not None:
+            waited = 0
+            while feed.latest() is None and waited < 30 and not own_stop.is_set():
+                await pause(0.1)
+                waited += 1
         completed = 0
         while max_cycles is None or completed < max_cycles:
-            if stop_event is not None and stop_event.is_set():
+            if own_stop.is_set():
                 break
+            if feed is not None:
+                with lock:
+                    published["market"] = feed.view()
             result = await run_cycle(
                 config,
                 transport=transport,
                 now=clock(),
                 manage_lock=False,
-                stop_event=stop_event,
+                stop_event=own_stop,
                 sleeper=pause,
+                ticker_feed=feed,
             )
             results.append(result.summary)
-            published["runtime"] = read_control(Path(settings.control_path)).mode
-            published["feed"] = _feed(published.get("feed") or {}, result)
-            published["strategy"] = _strategy(published.get("strategy") or {}, result.summary)
-            published["last_decision"] = {
-                "action": result.summary.get("action", ""),
-                "reason": result.reason,
-                "correlation_id": result.summary.get("correlation_id", ""),
-                "ts": result.summary.get("ts", ""),
-                "fill_written": bool(result.summary.get("fill_written")),
-            }
-            recent = list(published["recent_decisions"])
-            recent.append(published["last_decision"])
-            published["recent_decisions"] = recent[-20:]
-            _keep_book(published, result.summary)
-            if result.summary.get("equity_tail"):
-                published["equity"] = result.summary["equity_tail"]
-            write_json(Path(settings.status_path), published)
+            with lock:
+                published["runtime"] = read_control(Path(settings.control_path)).mode
+                published["feed"] = _feed(published.get("feed") or {}, result)
+                if feed is not None:
+                    published["market"] = feed.view()
+                published["strategy"] = _strategy(published.get("strategy") or {}, result.summary)
+                published["last_decision"] = {
+                    "action": result.summary.get("action", ""),
+                    "reason": result.reason,
+                    "correlation_id": result.summary.get("correlation_id", ""),
+                    "ts": result.summary.get("ts", ""),
+                    "fill_written": bool(result.summary.get("fill_written")),
+                }
+                recent = list(published["recent_decisions"])
+                recent.append(published["last_decision"])
+                published["recent_decisions"] = recent[-20:]
+                _keep_book(published, result.summary)
+                if result.summary.get("equity_tail"):
+                    published["equity"] = result.summary["equity_tail"]
+                write_json(Path(settings.status_path), published)
             completed += 1
-            if stop_event is not None and stop_event.is_set():
+            if own_stop.is_set():
                 break
             if max_cycles is not None and completed >= max_cycles:
                 break
-            stopped = await _wait(pause, settings.poll_seconds, stop_event)
+            stopped = await _wait(pause, settings.poll_seconds, own_stop)
             if stopped:
                 break
         published["runtime"] = "stopped"
         write_json(Path(settings.status_path), published)
         return {"cycles": len(results), "results": results, "status_port": published.get("status_port")}
     finally:
+        if feed is not None:
+            await feed.stop()
+        if feed_task is not None:
+            feed_task.cancel()
+            try:
+                await feed_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if clock_task is not None:
+            clock_task.cancel()
+            try:
+                await clock_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if server is not None:
             server.stop()
-        lock.release()
+        book_lock.release()
 
 
 def _feed(previous: dict[str, Any], result: Any) -> dict[str, Any]:
@@ -139,6 +193,7 @@ def _feed(previous: dict[str, Any], result: Any) -> dict[str, Any]:
         "reason": result.reason,
         "ticker_age_ms": summary.get("ticker_age_ms", ""),
         "as_of": summary.get("observed_at") or summary.get("ts") or "",
+        "quote_source": summary.get("quote_source") or "",
     }
     price = summary.get("last_price") or ""
     mark = summary.get("mark_price") or ""
@@ -185,6 +240,37 @@ def _keep_book(published: dict[str, Any], summary: dict[str, Any]) -> None:
     if published.get("book"):
         published["book"]["stale"] = True
         published["book"]["as_of"] = summary.get("observed_at") or published["book"].get("as_of", "")
+
+
+def _copy_status(published: dict[str, Any], lock: threading.Lock, feed: PublicTickerFeed | None) -> dict[str, Any]:
+    """Copy under the lock. Refresh the stream view so the page is not stuck on the last decision."""
+    with lock:
+        if feed is not None:
+            published["market"] = feed.view()
+        body = copy.deepcopy(published)
+    body["served_at_ms"] = epoch_ms(datetime.now(timezone.utc))
+    return body
+
+
+async def _clock_sync(feed: PublicTickerFeed, settings, stop: asyncio.Event, pause: SleepFn) -> None:
+    client = PublicMarketClient(settings)
+    while not stop.is_set() and not feed._stop.is_set():
+        try:
+            sample = await client.measure_clock()
+            feed.set_clock(
+                sample.status,
+                sample.offset_ms,
+                sample.rtt_ms,
+                sample.uncertainty_ms,
+                sample.server_time_ms,
+            )
+        except QuoteRejected as exc:
+            feed.set_clock_failed(exc.reason)
+        except Exception as exc:  # noqa: BLE001 - clock sync must not kill the book
+            feed.set_clock_failed(type(exc).__name__)
+        stopped = await _wait(pause, settings.clock_sync_seconds, stop)
+        if stopped:
+            break
 
 
 async def _wait(pause: SleepFn, seconds: float, stop_event: asyncio.Event | None) -> bool:

@@ -156,7 +156,7 @@ a { color: inherit; text-decoration: none; }
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .panel { padding: 12px 16px; }
 .panel h2, .chart-head { font-size: 16px; margin: 0 0 8px; }
-.kv { display: grid; grid-template-columns: 88px 1fr; gap: 4px 10px; font-size: 13px; }
+.kv { display: grid; grid-template-columns: 132px 1fr; gap: 4px 10px; font-size: 13px; }
 .kv dt { color: var(--text-soft); }
 .kv dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .chart-card { margin: 16px 0; padding: 10px; }
@@ -356,6 +356,97 @@ def _equity_table(rows: list[dict[str, Any]]) -> str:
     return "".join(body)
 
 
+_CONN = {
+    "disconnected": "未连接",
+    "connecting": "连接中",
+    "connected": "已连接",
+    "stopping": "正在停止",
+    "disabled": "未启用",
+    "not_started": "未启动",
+}
+_SUB = {
+    "none": "尚未订阅",
+    "pending": "订阅中",
+    "subscribed": "已订阅",
+    "error": "订阅失败",
+}
+_BEAT = {
+    "idle": "尚未心跳",
+    "waiting": "等待 pong",
+    "ok": "心跳正常",
+    "late": "心跳超时",
+}
+_CLOCK = {
+    "uncalibrated": "未校准",
+    "ok": "已对时",
+    "within_noise": "偏差落在往返不确定度内",
+    "shifted": "时钟偏差过大",
+    "failed": "对时失败",
+}
+_SOURCE = {
+    "bitget_public_ws_v3": "公开 WebSocket",
+    "bitget_public_rest_v3": "公开 REST",
+    "none": "没有可用行情",
+}
+
+
+def _ms_text(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "未采集"
+    return str(value)
+
+
+def _monitor(snapshot: dict[str, Any]) -> str:
+    market = snapshot.get("market") if isinstance(snapshot.get("market"), dict) else {}
+    if not market:
+        return '<section class="card panel" id="live"><h2>实时行情</h2><p class="empty">未采集</p></section>'
+    served = snapshot.get("served_at_ms")
+    received = market.get("received_at_ms")
+    cache_age = "未采集"
+    if isinstance(served, int) and isinstance(received, int) and not isinstance(served, bool):
+        cache_age = str(served - received)
+    samples = market.get("interval_samples")
+    sample_line = "样本不足，不计算分位数。"
+    if isinstance(samples, int) and samples > 0:
+        sample_line = (
+            f"相邻推送间隔样本 {samples} / 窗口 {_esc(market.get('interval_window'))}。"
+            f"最近 {_ms_text(market.get('interval_last_ms'))} ms，"
+            f"最小 {_ms_text(market.get('interval_min_ms'))}，最大 {_ms_text(market.get('interval_max_ms'))}。"
+            "这是两次有效快照的服务端时间差，不是延迟保证，也不是 p95。"
+        )
+    fresh = "尚无有效快照"
+    max_age = market.get("max_quote_age_seconds")
+    if cache_age != "未采集" and isinstance(max_age, int):
+        fresh = "未超过配置的行情年龄" if int(cache_age) <= max_age * 1000 else "已超过配置的行情年龄，不能当作成交价"
+    arrival = market.get("arrival_minus_server_ms")
+    arrival_text = _ms_text(arrival) if arrival is not None else "未采集"
+    return f"""<section class="card panel" id="live">
+      <h2>实时行情与延迟</h2>
+      <dl class="kv">
+        <dt>连接</dt><dd>{_labeled(_CONN, market.get("connection"))}</dd>
+        <dt>订阅</dt><dd>{_labeled(_SUB, market.get("subscription"))}</dd>
+        <dt>心跳</dt><dd>{_labeled(_BEAT, market.get("heartbeat"))}</dd>
+        <dt>决策所用</dt><dd>{_labeled(_SOURCE, market.get("trade_source"))}</dd>
+        <dt>回退原因</dt><dd>{_shown(market.get("trade_note"))}</dd>
+        <dt>最新价</dt><dd>{_shown(market.get("last_price"))}</dd>
+        <dt>买一 / 卖一</dt><dd>{_shown(market.get("bid"))} / {_shown(market.get("ask"))}</dd>
+        <dt>服务端消息时间</dt><dd>{_ms_text(market.get("server_ts_ms"))}</dd>
+        <dt>本机接收时间</dt><dd>{_ms_text(market.get("received_at_ms"))}</dd>
+        <dt>缓存年龄</dt><dd>{_esc(cache_age)} ms</dd>
+        <dt>接收减服务端</dt><dd>{_esc(arrival_text)} ms</dd>
+        <dt>有效消息</dt><dd>{_ms_text(market.get("accepted"))}</dd>
+        <dt>拒绝 / 乱序 / 未来</dt><dd>{_ms_text(market.get("rejected"))} / {_ms_text(market.get("disorder"))} / {_ms_text(market.get("future"))}</dd>
+        <dt>重连</dt><dd>{_ms_text(market.get("reconnects"))}</dd>
+        <dt>时钟</dt><dd>{_labeled(_CLOCK, market.get("clock_status"))}</dd>
+        <dt>时钟偏差估计</dt><dd>{_ms_text(market.get("clock_offset_ms"))} ms，往返 {_ms_text(market.get("clock_rtt_ms"))}，不确定度 ±{_ms_text(market.get("clock_uncertainty_ms"))}</dd>
+        <dt>新鲜度</dt><dd>{_esc(fresh)}</dd>
+      </dl>
+      <p class="hint">{sample_line}</p>
+      <p class="hint">接收减服务端消息时间包含时钟差、网络和排队，不是单程网络延迟。负值会原样显示。心跳正常只说明 ping/pong 还在，不代表行情仍然新鲜。页面约 5 秒刷新一次；推送只在行情变化时发生，官方写明大约 200ms，那不是延迟保证。买卖仍按已收盘 1 分钟 K 线和配置的轮询间隔，不会每个跳动都成交。</p>
+      <p class="hint">{_esc(market.get("subscribe_error") or "")}</p>
+    </section>"""
+
+
 def _page(snapshot: dict[str, Any]) -> str:
     feed = snapshot.get("feed") if isinstance(snapshot.get("feed"), dict) else {}
     book = snapshot.get("book") if isinstance(snapshot.get("book"), dict) else {}
@@ -461,6 +552,7 @@ def _page(snapshot: dict[str, Any]) -> str:
       <p class="hint">紧急停止默认不平仓。只有配置 emergency_flatten: true 时，紧急停止才会用合格行情做一次本地卖出。</p>
     </section>
   </div>
+  {_monitor(snapshot)}
   <section class="card chart-card" id="equity">
     <div class="chart-head">权益 · 本机记账</div>
     {_equity_svg(equity)}

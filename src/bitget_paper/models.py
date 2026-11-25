@@ -295,6 +295,7 @@ class ValidatedQuote(BaseModel):
     min_order_amount: Decimal
     max_market_order_amount: Decimal | None = None
     min_order_qty: Decimal | None = None
+    source: Literal["bitget_public_rest_v3", "bitget_public_ws_v3"] = "bitget_public_rest_v3"
 
     @model_validator(mode="after")
     def _book(self) -> "ValidatedQuote":

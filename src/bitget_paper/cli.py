@@ -17,6 +17,7 @@ from pathlib import Path
 from .config import BitgetPaperConfigError, load_raw_config, settings_from_root
 from .engine import run_cycle
 from .loop import run_loop
+from .public_ws import diagnose_stream
 from .models import StateError
 from .store import read_control, write_control
 
@@ -46,8 +47,16 @@ def main(argv: list[str] | None = None, transport=None, sleep=None) -> int:
         help="write pause or emergency state; does not trade",
     )
     mode.add_argument("--status", action="store_true", help="print the last status file")
+    mode.add_argument("--ws-diagnose", action="store_true", help="public ticker stream only; does not trade")
     parser.add_argument("--max-cycles", type=int, default=None)
+    parser.add_argument("--seconds", type=int, default=90, help="bounded public stream diagnose, 10 to 120")
     args = parser.parse_args(argv)
+    if args.ws_diagnose and not 10 <= args.seconds <= 120:
+        print(
+            json.dumps({"status": "config_rejected", "reason": "diagnose_seconds", "execution": "not_started"}, ensure_ascii=False),
+            file=sys.stderr,
+        )
+        return 2
     if args.max_cycles is not None and not args.run:
         print(
             json.dumps({"status": "config_rejected", "reason": "max_cycles_requires_run"}, ensure_ascii=False),
@@ -70,6 +79,11 @@ def main(argv: list[str] | None = None, transport=None, sleep=None) -> int:
                 return 4
             print(path.read_text(encoding="utf-8"))
             return 0
+        if args.ws_diagnose:
+            settings = settings_from_root(config)
+            report = asyncio.run(diagnose_stream(settings, args.seconds))
+            print(json.dumps(report, ensure_ascii=False))
+            return 0 if report["market"]["accepted"] else 3
         if args.run:
             stop = asyncio.Event()
 

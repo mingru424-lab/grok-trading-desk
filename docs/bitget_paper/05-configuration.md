@@ -17,7 +17,13 @@
 | `poll_seconds` | 20 | 轮询间隔，允许 5 到 300 |
 | `max_cycle_retries` | 2 | 只重试传输失败和 429/5xx |
 | `timeout_seconds` | 10 | 单次 HTTP 超时 |
-| `max_quote_age_seconds` | 15 | ticker 最大年龄 |
+| `max_quote_age_seconds` | 15 | ticker 最大年龄，单位秒。WebSocket 和 REST 都用它 |
+| `clock_skew_seconds` | 2 | 允许的未来时间，单位秒。超过对时不确定度后再超出这个值，会停止这一轮买卖 |
+| `public_ws_enabled` | true | 旧文件没写这项也是 true。false 才关闭实时流。不改其它风险和策略字段 |
+| `ws_ping_seconds` | 30 | 文本 ping 间隔，单位秒，必须大于 pong 超时 |
+| `ws_pong_timeout_seconds` | 10 | 发出 ping 后多久没收到 pong 就重连，单位秒 |
+| `ws_reconnect_max_seconds` | 30 | 重连退避上限，单位秒，实际等待会再乘一个 0.5 到 1 的抖动 |
+| `clock_sync_seconds` | 60 | 多久向 `/api/v3/market/time` 对一次时，单位秒 |
 | `emergency_flatten` | false | 紧急停止是否平仓 |
 | `status_host` / `status_port` | 127.0.0.1 / 8765 | 状态页 |
 | `state_path` | `logs/bitget_paper_state.json` | 账本 |

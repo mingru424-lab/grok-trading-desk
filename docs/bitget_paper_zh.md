@@ -23,7 +23,13 @@ python -m src.bitget_paper --config config.yaml --once
 python -m src.bitget_paper --config config.yaml --run
 ```
 
-`--run` 按 `poll_seconds` 轮询，直到 Ctrl-C 或 SIGTERM。当前这一轮如果已经开始，会做完再停，不会再开新的一笔。状态页默认只听 `127.0.0.1:8765`，标题是「钱多多 · BTCUSDT」。样式嵌在程序里，不用构建，也不下载前端资源。已经在跑的进程要先停掉再启动，才会换成新页面。不要覆盖运行目录里的配置、账本和日志。说明见 [docs/bitget_paper/07-status-ui.md](bitget_paper/07-status-ui.md)。
+`--run` 按 `poll_seconds` 轮询，直到 Ctrl-C 或 SIGTERM。当前这一轮如果已经开始，会做完再停，不会再开新的一笔。状态页默认只听 `127.0.0.1:8765`，标题是「钱多多 · BTCUSDT」。样式嵌在程序里，不用构建，也不下载前端资源。已经在跑的进程要先停掉再启动，才会换成新页面。不要覆盖运行目录里的配置、账本和日志。界面说明见 [docs/bitget_paper/07-status-ui.md](bitget_paper/07-status-ui.md)。实时行情和延迟监控的原理见 [docs/bitget_paper/08-realtime.md](bitget_paper/08-realtime.md)。
+
+只看公开行情、不写账本：
+
+```bash
+python -m src.bitget_paper --config config.yaml --ws-diagnose --seconds 90
+```
 
 ```bash
 python -m src.bitget_paper --config config.yaml --control pause
