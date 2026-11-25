@@ -484,6 +484,9 @@ async def _run_locked(
                 action,
                 epoch_ms(clock) - quote.ticker_ts_ms,
                 clock.isoformat(),
+                quote,
+                mark_price,
+                decision,
             )
         return _sell(
             state, quote, settings, log, state_path, clock, decision, correlation, desk_mode,
@@ -536,7 +539,7 @@ async def _run_locked(
     _write_equity(settings, bought, unrealized, correlation)
     return _book_result(
         "filled", decision.reason, True, bought, unrealized, correlation, desk_mode, "BUY",
-        epoch_ms(clock) - quote.ticker_ts_ms, clock.isoformat(),
+        epoch_ms(clock) - quote.ticker_ts_ms, clock.isoformat(), quote, mark_price, decision,
     )
 
 
@@ -696,8 +699,20 @@ def _book_result(
     action: str,
     ticker_age_ms: int | None = None,
     observed_at: str = "",
+    quote: ValidatedQuote | None = None,
+    mark_price: Decimal | None = None,
+    decision: DemoDecision | None = None,
 ) -> CycleResult:
+    """Book summary plus display fields. The extra strings do not change the fill."""
     equity = equity_of(state, unrealized)
+    extra: dict[str, Any] = {}
+    if quote is not None:
+        extra["last_price"] = money_str(quote.last)
+    if mark_price is not None:
+        extra["mark_price"] = money_str(mark_price)
+    if decision is not None:
+        extra["fast_sma"] = decision.basis.fast_sma
+        extra["slow_sma"] = decision.basis.slow_sma
     return _result(
         status,
         reason,
@@ -714,6 +729,7 @@ def _book_result(
         equity_usd=money_str(equity, signed=True),
         equity_tail=[point.model_dump() for point in state.equity_tail],
         desk_mode_ignored=desk_mode,
+        **extra,
     )
 
 
@@ -738,7 +754,7 @@ def _reject(
     _write_equity(settings, marked, unrealized, correlation)
     return _book_result(
         "risk_rejected", reason, False, marked, unrealized, correlation, desk_mode, decision.action,
-        epoch_ms(clock) - quote.ticker_ts_ms, clock.isoformat(),
+        epoch_ms(clock) - quote.ticker_ts_ms, clock.isoformat(), quote, mark_price, decision,
     )
 
 
@@ -773,7 +789,7 @@ def _sell(state, quote, settings, log, state_path, clock, decision, correlation,
     _write_equity(settings, sold, unrealized, correlation)
     return _book_result(
         "filled", decision.reason, True, sold, unrealized, correlation, desk_mode, "SELL",
-        epoch_ms(clock) - quote.ticker_ts_ms, clock.isoformat(),
+        epoch_ms(clock) - quote.ticker_ts_ms, clock.isoformat(), quote, mark_price, decision,
     )
 
 

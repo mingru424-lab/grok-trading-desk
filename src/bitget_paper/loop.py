@@ -97,17 +97,14 @@ async def run_loop(
             )
             results.append(result.summary)
             published["runtime"] = read_control(Path(settings.control_path)).mode
-            published["feed"] = {
-                "status": "ok" if result.exit_code == 0 else "rejected",
-                "reason": result.reason,
-                "ticker_age_ms": result.summary.get("ticker_age_ms", ""),
-                "as_of": result.summary.get("observed_at") or result.summary.get("ts") or "",
-            }
+            published["feed"] = _feed(published.get("feed") or {}, result)
+            published["strategy"] = _strategy(published.get("strategy") or {}, result.summary)
             published["last_decision"] = {
                 "action": result.summary.get("action", ""),
                 "reason": result.reason,
                 "correlation_id": result.summary.get("correlation_id", ""),
                 "ts": result.summary.get("ts", ""),
+                "fill_written": bool(result.summary.get("fill_written")),
             }
             recent = list(published["recent_decisions"])
             recent.append(published["last_decision"])
@@ -131,6 +128,41 @@ async def run_loop(
         if server is not None:
             server.stop()
         lock.release()
+
+
+def _feed(previous: dict[str, Any], result: Any) -> dict[str, Any]:
+    """Quote display. A rejected cycle keeps the last price and marks it stale."""
+    summary = result.summary
+    status = "ok" if result.exit_code == 0 else "rejected"
+    body = {
+        "status": status,
+        "reason": result.reason,
+        "ticker_age_ms": summary.get("ticker_age_ms", ""),
+        "as_of": summary.get("observed_at") or summary.get("ts") or "",
+    }
+    price = summary.get("last_price") or ""
+    mark = summary.get("mark_price") or ""
+    if price:
+        body["last_price"] = price
+        body["price_stale"] = status != "ok"
+    else:
+        body["last_price"] = previous.get("last_price", "")
+        body["price_stale"] = bool(body["last_price"])
+    if mark:
+        body["mark_price"] = mark
+    else:
+        body["mark_price"] = previous.get("mark_price", "")
+    return body
+
+
+def _strategy(previous: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+    body = dict(previous)
+    fast = summary.get("fast_sma") or ""
+    slow = summary.get("slow_sma") or ""
+    if fast:
+        body["fast_sma"] = fast
+        body["slow_sma"] = slow
+    return body
 
 
 def _keep_book(published: dict[str, Any], summary: dict[str, Any]) -> None:

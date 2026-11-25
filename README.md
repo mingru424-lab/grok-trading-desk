@@ -228,7 +228,8 @@ other than `simulate`. A bad `bitget_paper` block stops; it does not fall
 through into Alpaca or the Solana stub. The one-shot rule is a pipeline
 demonstration, not a forecast.
 
-Operator instructions, scope checklist, and the maintenance log are in Chinese:
+The local status page is named 钱多多. Operator instructions, scope checklist,
+and the maintenance log are in Chinese:
 [docs/bitget_paper_zh.md](docs/bitget_paper_zh.md).
 
 ```bash

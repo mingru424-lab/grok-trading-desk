@@ -43,3 +43,11 @@
 这两次都跑在 `6d57ea6`。本条记录本身是之后的文档提交，会再触发一次检查；写下这条时还不能把那次新运行说成已经成功。
 
 公开行情没有被要求成交。`--smoke` 退出码 0，`authenticated` 为 false。`--run --max-cycles 2` 退出码 0。同一本账再 `--once` 是 `baseline_stay_flat`，`fill_count` 仍是 0。买卖回合只在标明为合成 K 线的离线测试里强制出现。
+
+## 2026-11-25 状态页
+
+- 只读页的产品名改为钱多多。视觉从量化 2.0 `k-line-director` 提交 `30f6897ccd611c31a84cdfd26ac09523962d5edd` 的 `frontend/src/styles/theme.css`、顶栏、指标卡、信号表和页脚搬过来。对应关系写在 `07-status-ui.md`。
+- 币安合约、A 股、期货、资讯、回测、AI 和 K 线没有接到这本账，页面只标明未接入，没有不能用的按钮。没有权益点就不画线。
+- 每轮摘要额外带上当时已经算出的最新价、标记价和快慢均线，给页面显示。买卖、持仓、风控和账本迁移的规则没有改。
+- 云端开发机 Python 3.12.3。写下这条之前跑了 `/tmp/paper-venv/bin/python -m pytest -q -m "not network"`，2026-11-25 07:56 UTC，296 passed，2 deselected。这不是用户 Mac 上的结果。
+- 同一台云端机器用临时目录跑了公开行情 `--run --max-cycles 2`。结束时是 HOLD、`baseline_stay_flat`、持仓 0。运行中截图看到的价格是当时的公开行情，不是策略成绩。没有连接或替换 `/Users/ming/Documents/qianduoduo-paper-run`。

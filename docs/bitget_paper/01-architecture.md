@@ -9,7 +9,7 @@ strategy.py       baseline_sma_cross_v1，以及可选的旧一次性规则
 risk.py           仓位和亏损门闩，复用 shared/risk.py 的亏损判断
 broker.py         本地买卖。买在更差的卖一，卖在更差的买一
 store.py          版本、迁移、文件锁、控制文件、权益追加
-status_server.py  127.0.0.1 上的只读 HTML 和 /health
+status_server.py  127.0.0.1 上的只读 HTML 和 /health。页面名钱多多，样式内嵌
 models.py         严格决策契约和账本
 config.py         只接受 simulate，拒绝密钥字段
 ```

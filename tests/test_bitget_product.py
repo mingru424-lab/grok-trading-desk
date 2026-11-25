@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import pytest
@@ -16,9 +17,9 @@ import pytest
 from src.bitget_paper.cli import main
 from src.bitget_paper.config import settings_from_section
 from src.bitget_paper.engine import run_cycle
-from src.bitget_paper.loop import run_loop
+from src.bitget_paper.loop import _feed, run_loop
 from src.bitget_paper.models import StateError
-from src.bitget_paper.status_server import StatusServer
+from src.bitget_paper.status_server import StatusServer, _page
 from src.bitget_paper.store import BookLock, lock_path_for, write_control
 from tests.test_bitget_paper import (
     NOW,
@@ -223,6 +224,9 @@ async def test_run_loop_persists_two_cycles_and_stops(tmp_path):
     assert status["runtime"] == "stopped"
     assert status["banner"] == "PAPER ONLY"
     assert status["authenticated"] is False
+    assert status["feed"]["last_price"]
+    assert status["strategy"]["fast_sma"]
+    assert status["last_decision"]["fill_written"] is False
 
 
 def test_status_page_is_loopback_and_read_only():
@@ -270,10 +274,96 @@ def test_status_page_is_loopback_and_read_only():
         assert "不是交易所订单" in page
         assert "紧急停止默认不平仓" in page
         assert "baseline_keep_long" in page
+        assert "钱多多" in page
+        try:
+            urlopen(f"http://127.0.0.1:{port}/missing")
+        except HTTPError as exc:
+            missing = exc.read().decode()
+            assert exc.code == 404
+        else:
+            raise AssertionError("missing path was not a 404")
+        assert "没有这个路径" in missing
+        assert "权益 USD" not in missing
+        assert "baseline_keep_long" not in missing
+        assert "0.0004" not in missing
     finally:
         server.stop()
     with pytest.raises(ValueError):
         StatusServer("0.0.0.0", 0, lambda: snapshot)
+
+
+def test_status_page_binds_real_states_and_escapes_text():
+    """Synthetic snapshots. These numbers are not a live Bitget print."""
+    hostile = "<script>alert(1)</script>"
+    empty = _page({"runtime": "", "feed": {}, "book": {}, "strategy": {}, "risk": {}, "equity": [], "recent_decisions": []})
+    assert "钱多多" in empty
+    assert "未采集" in empty
+    assert "尚无足够权益点，不绘制曲线" in empty
+    assert "未接入" in empty
+    assert "echarts" not in empty
+    assert "cdn" not in empty.lower()
+
+    held = _page({
+        "runtime": "paused",
+        "feed": {"status": "rejected", "reason": hostile, "last_price": "61000", "price_stale": True, "ticker_age_ms": 9000},
+        "book": {
+            "cash_usd": "70",
+            "quantity_btc": "0.0004",
+            "realized_usd": "-1.25",
+            "unrealized_usd": "0.50",
+            "equity_usd": "99",
+            "stale": True,
+            "as_of": "2026-11-25T00:00:00+00:00",
+        },
+        "strategy": {"id": "baseline_sma_cross_v1", "fast_period": 5, "slow_period": 20, "interval": "1m", "fast_sma": "100", "slow_sma": "90"},
+        "risk": {"max_position_usd": "100", "max_loss_usd": "100", "max_drawdown_pct": "0.25", "emergency_flatten": False, "fee_bps": 10, "slippage_bps": 5},
+        "last_decision": {"action": "HOLD", "reason": "baseline_keep_long"},
+        "recent_decisions": [
+            {"ts": "t", "action": "BUY", "reason": hostile, "correlation_id": "c1", "fill_written": False},
+            {"ts": "t2", "action": "SELL", "reason": "x" * 400, "correlation_id": "c2", "fill_written": True},
+        ],
+        "equity": [
+            {"ts": "t0", "equity_usd": "100", "cash_usd": "100", "realized_usd": "0", "unrealized_usd": "0"},
+            {"ts": "t1", "equity_usd": "99", "cash_usd": "70", "realized_usd": "-1.25", "unrealized_usd": "0.50"},
+            {"ts": "bad", "equity_usd": "NaN", "cash_usd": "1", "realized_usd": "0", "unrealized_usd": "0"},
+            {"ts": "huge", "equity_usd": "9" * 40, "cash_usd": "1", "realized_usd": "0", "unrealized_usd": "0"},
+        ],
+    })
+    assert "已暂停 · paused" in held
+    assert "已拒绝 · rejected" in held
+    assert "行情未刷新" in held
+    assert "账本沿用上一笔" in held
+    assert "0.0004" in held
+    assert "61000" in held
+    assert "<dt>快均线</dt><dd>100</dd>" in held
+    assert "<script>alert(1)</script>" not in held
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in held
+    assert "polyline" in held
+    assert "只有 2 个已记录的权益点" in held
+    assert "已写入本地成交" in held
+    assert "未写入成交" in held
+
+    stopped = _page({
+        "runtime": "emergency_stop",
+        "feed": {"status": "ok", "last_price": "1"},
+        "book": {"cash_usd": "100", "quantity_btc": "0", "equity_usd": "100", "stale": False},
+        "risk": {"emergency_flatten": True},
+        "recent_decisions": [],
+        "equity": [{"equity_usd": "100"}],
+    })
+    assert "紧急停止 · emergency_stop" in stopped
+    assert "是 · true" in stopped
+    assert "尚无足够权益点" in stopped
+
+    class _Result:
+        exit_code = 3
+        reason = "stale_ticker"
+        summary = {}
+
+    kept = _feed({"last_price": "100", "mark_price": "99"}, _Result())
+    assert kept["last_price"] == "100"
+    assert kept["price_stale"] is True
+    assert kept["status"] == "rejected"
 
 
 def test_public_host_and_fast_period_are_rejected():
