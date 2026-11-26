@@ -17,7 +17,7 @@ from .config import settings_from_root
 from .engine import run_cycle
 from .market import PublicMarketClient
 from .models import QuoteRejected, epoch_ms
-from .public_ws import PublicTickerFeed
+from .public_ws import PublicTickerFeed, require_websockets
 from .status_server import StatusServer
 from .store import BookLock, lock_path_for, read_control, write_json
 from pathlib import Path
@@ -89,6 +89,7 @@ async def run_loop(
     own_stop = stop_event or asyncio.Event()
     try:
         if settings.public_ws_enabled and transport is None:
+            require_websockets()
             feed = PublicTickerFeed(settings, now_fn=clock)
             published["market"] = feed.view()
             feed_task = asyncio.create_task(feed.run(own_stop))

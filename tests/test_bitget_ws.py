@@ -17,7 +17,7 @@ from src.bitget_paper.market import (
     judge_clock,
     parse_server_time,
 )
-from src.bitget_paper.models import QuoteRejected
+from src.bitget_paper.models import QuoteRejected, StateError
 from src.bitget_paper.loop import _copy_status
 from src.bitget_paper.public_ws import PublicTickerFeed
 from src.bitget_paper.status_server import _page
@@ -142,17 +142,18 @@ async def test_subscribe_snapshot_and_stop(tmp_path):
     assert any(item.startswith('{"op":"subscribe"') for item in sock.sent)
 
 
-async def test_malformed_disorder_and_future_do_not_replace_a_good_snap(tmp_path):
+async def test_malformed_disorder_and_zero_do_not_replace_a_good_snap(tmp_path):
     good = _snapshot(NOW_MS, "100")
     older = _snapshot(NOW_MS - 1000, "90")
-    future = _snapshot(NOW_MS + 10_000, "1")
-    sock = _Sock([_ACK, "{", good, older, future, _snapshot(NOW_MS, "0")])
+    newer = _snapshot(NOW_MS + 500, "101")
+    zero = _snapshot(NOW_MS + 600, "0")
+    sock = _Sock([_ACK, "{", good, older, newer, zero])
     feed = await _run_feed(tmp_path, sock)
     assert feed.latest() is not None
-    assert feed.latest().last == Decimal("100")
-    assert feed.rejected >= 3
+    assert feed.latest().last == Decimal("101")
+    assert feed.rejected >= 2
     assert feed.disorder >= 1
-    assert feed.future >= 1
+    assert feed.future == 0
 
 
 async def test_reconnects_after_a_dropped_socket(tmp_path):
@@ -290,6 +291,9 @@ class _Feed:
     def latest(self):
         return self._snap
 
+    def tradable_snap(self):
+        return self._snap
+
     def clock_blocks_trading(self):
         return self.shifted
 
@@ -312,11 +316,12 @@ async def test_fresh_ws_snapshot_is_used_and_rest_ticker_is_not(tmp_path):
 async def test_stale_ws_falls_back_to_fresh_rest(tmp_path):
     instruments, tickers = fresh_payloads(NOW_MS)
     candles = dump(candle_payload(NOW_MS, bullish_closes()))
-    script = Script([(200, instruments), (200, instruments), (200, tickers), (200, candles)])
+    script = Script([(200, instruments), (200, tickers), (200, candles)])
     feed = _Feed(_snap(NOW_MS - 30_000))
+    feed.tradable_snap = lambda: None
     result = await run_cycle(paper_config(tmp_path), transport=script, now=NOW, ticker_feed=feed)
     assert result.summary["quote_source"] == "bitget_public_rest_v3"
-    assert feed.notes[-1][1] == "stale_quote"
+    assert feed.notes[-1][1] == "no_snapshot"
 
 
 async def test_clock_shift_and_stale_rest_do_not_clear_a_position(tmp_path):
@@ -335,3 +340,207 @@ async def test_clock_shift_and_stale_rest_do_not_clear_a_position(tmp_path):
     kept = load_state(tmp_path / "state.json", _settings(tmp_path), NOW)
     assert kept.quantity_btc == Decimal("0.001")
     assert script.calls == []
+
+
+def _armed_feed(tmp_path) -> PublicTickerFeed:
+    feed = PublicTickerFeed(_settings(tmp_path), now_fn=lambda: from_epoch_ms(NOW_MS))
+    feed.set_clock("ok", 0, 20, 10, NOW_MS)
+    return feed
+
+
+def test_five_second_offset_is_not_hidden_by_a_long_round_trip(tmp_path):
+    settings = _settings(tmp_path)
+    buried = ClockSample("ok", 5_000, 12_000, 6_000, NOW_MS, NOW_MS)
+    assert judge_clock(buried, settings) == "shifted"
+    feed = _armed_feed(tmp_path)
+    feed.set_clock("shifted", 5_000, 12_000, 6_000, NOW_MS)
+    assert feed.clock_blocks_trading() is True
+
+
+def test_time_failure_drops_the_old_offset(tmp_path):
+    feed = _armed_feed(tmp_path)
+    feed.set_clock_failed("transport_error")
+    assert feed.clock_status == "uncalibrated"
+    assert feed.clock_offset_ms is None
+    assert feed.clock_blocks_trading() is True
+
+
+def test_expired_clock_sample_becomes_uncalibrated(tmp_path):
+    import time
+    feed = _armed_feed(tmp_path)
+    feed._clock_mono = time.monotonic() - feed.settings.clock_sync_seconds - 1
+    assert feed.clock_blocks_trading() is True
+    assert feed.clock_status == "uncalibrated"
+    assert feed.clock_offset_ms is None
+
+
+def test_disconnected_or_unsubscribed_cache_is_not_tradable(tmp_path):
+    import time
+    feed = _armed_feed(tmp_path)
+    fresh = TickerSnap(Decimal("100"), Decimal("100"), Decimal("100"), Decimal("1"), Decimal("1"), NOW_MS, NOW_MS, time.monotonic())
+    feed._snap = fresh
+    feed.connection = "disconnected"
+    feed.subscription = "subscribed"
+    assert feed.tradable_snap() is None
+    feed.connection = "connected"
+    feed.subscription = "pending"
+    assert feed.tradable_snap() is None
+    feed.subscription = "subscribed"
+    assert feed.tradable_snap() is not None
+    feed._snap = TickerSnap(Decimal("100"), Decimal("100"), Decimal("100"), Decimal("1"), Decimal("1"), NOW_MS, NOW_MS, time.monotonic() - 20)
+    assert feed.tradable_snap() is None
+
+
+async def test_disconnected_cache_cannot_open_a_position(tmp_path):
+    import time
+    feed = _armed_feed(tmp_path)
+    feed._snap = TickerSnap(Decimal("100"), Decimal("100"), Decimal("100"), Decimal("1"), Decimal("1"), NOW_MS, NOW_MS, time.monotonic())
+    feed.connection = "disconnected"
+    feed.subscription = "none"
+
+    async def down(method, url, params, headers):
+        raise ConnectionError("down")
+
+    result = await run_cycle(paper_config(tmp_path), transport=down, now=NOW, ticker_feed=feed)
+    assert result.fill_written is False
+    assert result.reason == "transport_error"
+    assert not (tmp_path / "state.json").exists() or load_state(tmp_path / "state.json", _settings(tmp_path), NOW).quantity_btc == 0
+
+
+async def test_pause_cancels_a_hung_request(tmp_path):
+    from src.bitget_paper.store import write_control
+    import time
+    write_control(tmp_path / "control.json", "paused")
+
+    async def hang(method, url, params, headers):
+        await asyncio.sleep(5)
+        raise AssertionError("hang should have been cancelled")
+
+    started = time.monotonic()
+    result = await run_cycle(paper_config(tmp_path), transport=hang, now=NOW)
+    assert time.monotonic() - started < 1.5
+    assert result.reason == "paused"
+    assert result.fill_written is False
+
+
+async def test_emergency_stop_does_not_wait_for_the_network(tmp_path):
+    from src.bitget_paper.store import write_control
+    write_control(tmp_path / "control.json", "emergency_stop")
+    called = []
+
+    async def boom(method, url, params, headers):
+        called.append(url)
+        raise AssertionError("network")
+
+    result = await run_cycle(paper_config(tmp_path), transport=boom, now=NOW)
+    assert result.reason == "emergency_stop_holds_position"
+    assert result.fill_written is False
+    assert called == []
+
+
+def test_second_os_process_cannot_take_the_book_lock(tmp_path):
+    import subprocess
+    import sys
+    from src.bitget_paper.store import BookLock, lock_path_for
+    path = lock_path_for(tmp_path / "state.json")
+    holder = subprocess.Popen(
+        [sys.executable, "-c", "import sys,time\nfrom pathlib import Path\nfrom src.bitget_paper.store import BookLock\nlock=BookLock(Path(sys.argv[1]))\nlock.acquire()\nprint('held', flush=True)\ntime.sleep(20)\n", str(path)],
+        cwd="/agent/repos/grok-trading-desk",
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        line = holder.stdout.readline()
+        assert "held" in line
+        try:
+            BookLock(path).acquire()
+        except Exception as exc:
+            assert getattr(exc, "reason", "") == "already_running"
+        else:
+            raise AssertionError("second process took the lock")
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+
+
+def test_failed_replace_leaves_the_previous_book(tmp_path, monkeypatch):
+    state = fresh_state(_settings(tmp_path), NOW).model_copy(update={"fill_count": 7, "quantity_btc": Decimal("0.001"), "cost_basis_usd": Decimal("50")})
+    save_state(tmp_path / "state.json", state)
+
+    def boom(*args, **kwargs):
+        raise OSError("killed")
+
+    monkeypatch.setattr("src.bitget_paper.engine.os.replace", boom)
+    changed = state.model_copy(update={"fill_count": 8})
+    with pytest.raises(StateError):
+        save_state(tmp_path / "state.json", changed)
+    kept = load_state(tmp_path / "state.json", _settings(tmp_path), NOW)
+    assert kept.fill_count == 7
+    assert kept.quantity_btc == Decimal("0.001")
+
+
+async def test_missing_websockets_does_not_reconnect(tmp_path):
+    class Missing:
+        async def __aenter__(self):
+            raise ModuleNotFoundError("websockets")
+
+        async def __aexit__(self, *args):
+            return False
+
+    feed = PublicTickerFeed(
+        _settings(tmp_path, ws_reconnect_max_seconds=1),
+        connector=lambda url, open_timeout: Missing(),
+        now_fn=lambda: from_epoch_ms(NOW_MS),
+    )
+    task = asyncio.create_task(feed.run())
+    for _ in range(20):
+        if feed.dependency_missing:
+            break
+        await asyncio.sleep(0.05)
+    await asyncio.sleep(0.3)
+    await feed.stop()
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+    assert feed.subscribe_error == "websockets_missing"
+    assert feed.reconnects == 0
+    assert feed.dependency_missing is True
+
+
+async def test_clean_close_is_not_a_subscribe_error(tmp_path):
+    class ConnectionClosedOK(Exception):
+        pass
+
+    external = asyncio.Event()
+
+    class Sock:
+        def __init__(self):
+            self.closed = False
+
+        async def send(self, data):
+            external.set()
+
+        async def recv(self):
+            raise ConnectionClosedOK()
+
+        async def close(self):
+            self.closed = True
+
+    sock = Sock()
+
+    class CM:
+        async def __aenter__(self):
+            return sock
+
+        async def __aexit__(self, *args):
+            await sock.close()
+            return False
+
+    feed = PublicTickerFeed(_settings(tmp_path), connector=lambda url, open_timeout: CM(), now_fn=lambda: from_epoch_ms(NOW_MS))
+    task = asyncio.create_task(feed.run(external))
+    await asyncio.wait_for(task, timeout=2)
+    assert feed.subscribe_error == ""
+    assert feed.reconnects == 0
+    assert sock.closed is True

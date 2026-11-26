@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -216,6 +218,38 @@ _THEME_JS = """
 """
 
 
+def _shanghai(value: Any) -> str | None:
+    """Readable Asia/Shanghai time. The raw value stays available to the caller."""
+    try:
+        zone = ZoneInfo("Asia/Shanghai")
+    except Exception:
+        return None
+    try:
+        if isinstance(value, int) and not isinstance(value, bool):
+            if value < 10**11:
+                return None
+            moment = datetime.fromtimestamp(value / 1000, tz=zone)
+            return moment.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(value, str) and "T" in value:
+            moment = datetime.fromisoformat(value)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return moment.astimezone(zone).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        return None
+    return None
+
+
+def _when(value: Any) -> str:
+    raw = "" if value is None else str(value).strip()
+    pretty = _shanghai(value)
+    if not raw:
+        return "未采集"
+    if pretty:
+        return f"{_esc(pretty)} 上海"
+    return _esc(raw)
+
+
 def _esc(value: Any) -> str:
     text = str(value)
     return (
@@ -321,7 +355,7 @@ def _decision_table(rows: list[dict[str, Any]]) -> str:
         reason = "" if item.get("reason") is None else str(item.get("reason"))
         body.append(
             "<tr>"
-            f"<td title=\"{_esc(item.get('ts', ''))}\">{_shown(item.get('ts'), '—')}</td>"
+            f"<td title=\"{_esc(item.get('ts', ''))}\">{_when(item.get('ts'))}</td>"
             f"<td>{_badge(item.get('action'))}</td>"
             f"<td title=\"{_esc(reason)}\">{_shown(reason, '—')}</td>"
             f"<td title=\"{_esc(item.get('correlation_id', ''))}\">{_shown(item.get('correlation_id'), '—')}</td>"
@@ -346,7 +380,7 @@ def _equity_table(rows: list[dict[str, Any]]) -> str:
     for item in rows[-12:]:
         body.append(
             "<tr>"
-            f"<td>{_shown(item.get('ts'), '—')}</td>"
+            f"<td title=\"{_esc(item.get('ts', ''))}\">{_when(item.get('ts'))}</td>"
             f"<td class=\"num\">{_shown(item.get('equity_usd'), '—')}</td>"
             f"<td class=\"num\">{_shown(item.get('cash_usd'), '—')}</td>"
             f"<td class=\"num {_pnl_class(item.get('realized_usd'))}\">{_shown(item.get('realized_usd'), '—')}</td>"
@@ -403,7 +437,10 @@ def _monitor(snapshot: dict[str, Any]) -> str:
     served = snapshot.get("served_at_ms")
     received = market.get("received_at_ms")
     cache_age = "未采集"
-    if isinstance(served, int) and isinstance(received, int) and not isinstance(served, bool):
+    mono_age = market.get("quote_age_ms")
+    if isinstance(mono_age, int) and not isinstance(mono_age, bool):
+        cache_age = str(mono_age)
+    elif isinstance(served, int) and isinstance(received, int) and not isinstance(served, bool):
         cache_age = str(served - received)
     samples = market.get("interval_samples")
     sample_line = "样本不足，不计算分位数。"
@@ -430,8 +467,8 @@ def _monitor(snapshot: dict[str, Any]) -> str:
         <dt>回退原因</dt><dd>{_shown(market.get("trade_note"))}</dd>
         <dt>最新价</dt><dd>{_shown(market.get("last_price"))}</dd>
         <dt>买一 / 卖一</dt><dd>{_shown(market.get("bid"))} / {_shown(market.get("ask"))}</dd>
-        <dt>服务端消息时间</dt><dd>{_ms_text(market.get("server_ts_ms"))}</dd>
-        <dt>本机接收时间</dt><dd>{_ms_text(market.get("received_at_ms"))}</dd>
+        <dt>服务端消息时间</dt><dd>{_when(market.get("server_ts_ms"))}</dd>
+        <dt>本机接收时间</dt><dd>{_when(market.get("received_at_ms"))}</dd>
         <dt>缓存年龄</dt><dd>{_esc(cache_age)} ms</dd>
         <dt>接收减服务端</dt><dd>{_esc(arrival_text)} ms</dd>
         <dt>有效消息</dt><dd>{_ms_text(market.get("accepted"))}</dd>
@@ -504,7 +541,7 @@ def _page(snapshot: dict[str, Any]) -> str:
       <div class="tlabel">权益 USD</div>
       <div class="tvalue">{_shown(book.get("equity_usd"))}</div>
       <div class="tband">{_esc(book_note)}</div>
-      <div class="tsub">截至 {_shown(book.get("as_of"))}</div>
+      <div class="tsub">截至 {_when(book.get("as_of"))}</div>
     </div>
     <div class="card tcard">
       <div class="tlabel">现金 USD</div>

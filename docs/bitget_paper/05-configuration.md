@@ -18,7 +18,7 @@
 | `max_cycle_retries` | 2 | 只重试传输失败和 429/5xx |
 | `timeout_seconds` | 10 | 单次 HTTP 超时 |
 | `max_quote_age_seconds` | 15 | ticker 最大年龄，单位秒。WebSocket 和 REST 都用它 |
-| `clock_skew_seconds` | 2 | 允许的未来时间，单位秒。超过对时不确定度后再超出这个值，会停止这一轮买卖 |
+| `clock_skew_seconds` | 2 | 对时绝对偏差硬上限，单位秒。超过就停止买卖，往返时间不会放宽。未校准也不能买卖 |
 | `public_ws_enabled` | true | 旧文件没写这项也是 true。false 才关闭实时流。不改其它风险和策略字段 |
 | `ws_ping_seconds` | 30 | 文本 ping 间隔，单位秒，必须大于 pong 超时 |
 | `ws_pong_timeout_seconds` | 10 | 发出 ping 后多久没收到 pong 就重连，单位秒 |

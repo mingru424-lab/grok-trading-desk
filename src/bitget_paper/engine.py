@@ -286,16 +286,32 @@ async def _run_locked(
     desk_mode = str(config.get("mode", ""))
     correlation = correlation_id or _new_correlation(state)
     client = PublicMarketClient(settings, transport=transport)
+    control_path = Path(settings.control_path)
     try:
+        early = _control_reason(settings, control_path, stop_event)
+        if early == "emergency_stop_holds_position" or early == "shutdown":
+            raise _ControlStop(early)
         if ticker_feed is not None and settings.public_ws_enabled and ticker_feed.clock_blocks_trading():
             raise QuoteRejected("clock_anomaly")
         if ticker_feed is not None and settings.public_ws_enabled:
+            snap_fn = getattr(ticker_feed, "tradable_snap", None) or ticker_feed.latest
             quote, ws_note = await _fetch_cycle_with_retry(
-                client, clock, settings, sleeper, ticker_feed.latest
+                client, clock, settings, sleeper, snap_fn, control_path, stop_event,
             )
             ticker_feed.note_trade(quote.source, ws_note)
         else:
-            quote = await _fetch_with_retry(client, clock, settings, sleeper)
+            quote = await _fetch_with_retry(client, clock, settings, sleeper, control_path, stop_event)
+    except _ControlStop as exc:
+        if ticker_feed is not None:
+            ticker_feed.note_trade("none", exc.reason)
+        return _result(
+            "control_held",
+            exc.reason,
+            3,
+            **_carried_book(state, clock, exc.reason),
+            correlation_id=correlation,
+            desk_mode_ignored=desk_mode,
+        )
     except QuoteRejected as exc:
         if ticker_feed is not None:
             ticker_feed.note_trade("none", exc.reason)
@@ -371,7 +387,20 @@ async def _run_locked(
     candles = None
     if settings.strategy != "deterministic_demo_flat_once_v1":
         try:
-            candles = await _fetch_candles_with_retry(client, clock, settings, sleeper)
+            candles = await _fetch_candles_with_retry(
+                client, clock, settings, sleeper, control_path, stop_event,
+            )
+        except _ControlStop as exc:
+            if ticker_feed is not None:
+                ticker_feed.note_trade("none", exc.reason)
+            return _result(
+                "control_held",
+                exc.reason,
+                3,
+                **_carried_book(state, clock, exc.reason),
+                correlation_id=correlation,
+                desk_mode_ignored=desk_mode,
+            )
         except QuoteRejected as exc:
             log.write(
                 "bitget_paper_quote_rejected",
@@ -632,47 +661,125 @@ def _retryable(exc: QuoteRejected) -> bool:
     return False
 
 
-async def _fetch_cycle_with_retry(client: PublicMarketClient, clock: datetime, settings: BitgetPaperSettings, sleeper, snap_fn):
+class _ControlStop(Exception):
+    def __init__(self, reason: str):
+        self.reason = reason
+
+
+def _control_reason(settings: BitgetPaperSettings, control_path: Path, stop_event: asyncio.Event | None) -> str | None:
+    if stop_event is not None and stop_event.is_set():
+        return "shutdown"
+    mode = read_control(control_path).mode
+    if mode == "emergency_stop" and not settings.emergency_flatten:
+        return "emergency_stop_holds_position"
+    if mode == "paused":
+        return "paused"
+    return None
+
+
+async def _await_unless_control(awaitable, settings, control_path, stop_event):
+    """Give pause and emergency stop a chance while a request is still running.
+
+    A healthy request that finishes inside the poll window is unchanged.
+    A hung request is cancelled on the next poll instead of waiting out every retry.
+    """
+    task = asyncio.create_task(awaitable)
+    try:
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=0.2)
+            if task in done:
+                return task.result()
+            reason = _control_reason(settings, control_path, stop_event)
+            if reason:
+                raise _ControlStop(reason)
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+async def _backoff_unless_control(settings, control_path, stop_event, sleeper, attempt: int) -> None:
+    reason = _control_reason(settings, control_path, stop_event)
+    if reason:
+        raise _ControlStop(reason)
+    await sleeper(float(settings.retry_backoff_seconds) * (2 ** attempt))
+    reason = _control_reason(settings, control_path, stop_event)
+    if reason:
+        raise _ControlStop(reason)
+
+
+async def _fetch_cycle_with_retry(
+    client: PublicMarketClient,
+    clock: datetime,
+    settings: BitgetPaperSettings,
+    sleeper,
+    snap_fn,
+    control_path: Path,
+    stop_event: asyncio.Event | None,
+):
     attempts = settings.max_cycle_retries + 1
     last: QuoteRejected | None = None
     for attempt in range(attempts):
         try:
-            return await client.fetch_cycle(clock, snap_fn())
+            return await _await_unless_control(client.fetch_cycle(clock, snap_fn()), settings, control_path, stop_event)
+        except _ControlStop:
+            raise
         except QuoteRejected as exc:
             last = exc
             if not _retryable(exc) or attempt + 1 >= attempts:
                 raise
-            await sleeper(float(settings.retry_backoff_seconds) * (2 ** attempt))
+            await _backoff_unless_control(settings, control_path, stop_event, sleeper, attempt)
     assert last is not None
     raise last
 
 
-async def _fetch_with_retry(client: PublicMarketClient, clock: datetime, settings: BitgetPaperSettings, sleeper) -> ValidatedQuote:
+async def _fetch_with_retry(
+    client: PublicMarketClient,
+    clock: datetime,
+    settings: BitgetPaperSettings,
+    sleeper,
+    control_path: Path,
+    stop_event: asyncio.Event | None,
+) -> ValidatedQuote:
     attempts = settings.max_cycle_retries + 1
     last: QuoteRejected | None = None
     for attempt in range(attempts):
         try:
-            return await client.fetch(clock)
+            return await _await_unless_control(client.fetch(clock), settings, control_path, stop_event)
+        except _ControlStop:
+            raise
         except QuoteRejected as exc:
             last = exc
             if not _retryable(exc) or attempt + 1 >= attempts:
                 raise
-            await sleeper(float(settings.retry_backoff_seconds) * (2 ** attempt))
+            await _backoff_unless_control(settings, control_path, stop_event, sleeper, attempt)
     assert last is not None
     raise last
 
 
-async def _fetch_candles_with_retry(client: PublicMarketClient, clock: datetime, settings: BitgetPaperSettings, sleeper):
+async def _fetch_candles_with_retry(
+    client: PublicMarketClient,
+    clock: datetime,
+    settings: BitgetPaperSettings,
+    sleeper,
+    control_path: Path,
+    stop_event: asyncio.Event | None,
+):
     attempts = settings.max_cycle_retries + 1
     last: QuoteRejected | None = None
     for attempt in range(attempts):
         try:
-            return await client.fetch_candles(clock)
+            return await _await_unless_control(client.fetch_candles(clock), settings, control_path, stop_event)
+        except _ControlStop:
+            raise
         except QuoteRejected as exc:
             last = exc
             if not _retryable(exc) or attempt + 1 >= attempts:
                 raise
-            await sleeper(float(settings.retry_backoff_seconds) * (2 ** attempt))
+            await _backoff_unless_control(settings, control_path, stop_event, sleeper, attempt)
     assert last is not None
     raise last
 

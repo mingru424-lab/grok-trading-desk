@@ -125,6 +125,7 @@ class TickerSnap:
     ask_size: Decimal
     server_ts_ms: int
     received_at_ms: int
+    received_mono: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -311,14 +312,18 @@ def clock_sample_from_rtt(before_ms: int, after_ms: int, server_ms: int) -> Cloc
 
 
 def judge_clock(sample: ClockSample, settings: BitgetPaperSettings) -> str:
-    """Name the sample. ``shifted`` is large enough to see past the round trip and the allowed skew."""
+    """Name the sample. Offset is not one-way delay.
+
+    ``shifted`` means the absolute offset is past ``clock_skew_seconds``.
+    A long round trip does not widen that limit or hide the offset.
+    """
     if sample.offset_ms is None or sample.uncertainty_ms is None or sample.rtt_ms is None:
         return "failed"
+    limit_ms = settings.clock_skew_seconds * 1000
+    if abs(sample.offset_ms) > limit_ms:
+        return "shifted"
     if abs(sample.offset_ms) <= sample.uncertainty_ms:
         return "within_noise"
-    allowance = settings.clock_skew_seconds * 1000 + sample.uncertainty_ms
-    if abs(sample.offset_ms) > allowance:
-        return "shifted"
     return "ok"
 
 
@@ -339,7 +344,9 @@ def assemble_ws_quote(
     skew_ms = settings.clock_skew_seconds * 1000
     instrument, instrument_time = _envelope(instrument_status, instrument_text)
     _check_fresh(instrument_time, now_ms, max_age_ms, skew_ms, "instrument_request_time")
-    _check_fresh(snap.server_ts_ms, now_ms, max_age_ms, skew_ms, "ticker_ts")
+    # The feed already applied the monotonic receipt-age gate. Do not age the
+    # ticker again with the wall clock; a jumped clock must not ban a live snap
+    # or, worse, was the old way a frozen clock looked "fresh".
     if instrument.get("symbol") != "BTCUSDT" or instrument.get("category") != "SPOT":
         raise QuoteRejected("symbol_mismatch")
     ticker = {

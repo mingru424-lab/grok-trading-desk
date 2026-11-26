@@ -18,12 +18,13 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import time
 from collections import deque
 from typing import Any
 
 from .config import PUBLIC_WS_URL, BitgetPaperSettings
 from .market import TickerSnap, _api_decimal
-from .models import QuoteRejected, epoch_ms
+from .models import BitgetPaperConfigError, QuoteRejected, epoch_ms
 
 _SUBSCRIBE = json.dumps(
     {"op": "subscribe", "args": [{"instType": "spot", "topic": "ticker", "symbol": "BTCUSDT"}]},
@@ -64,14 +65,52 @@ class PublicTickerFeed:
         self.clock_uncertainty_ms: int | None = None
         self.clock_server_ms: int | None = None
         self.clock_error = ""
+        self._clock_mono: float | None = None
         self.trade_source = "none"
         self.trade_note = ""
+        self.dependency_missing = False
 
     def latest(self) -> TickerSnap | None:
+        """Last accepted snapshot, including one that must not be traded."""
         return self._snap
 
+    def _clock_expired(self) -> bool:
+        if self._clock_mono is None:
+            return True
+        return (time.monotonic() - self._clock_mono) > self.settings.clock_sync_seconds
+
+    def _expire_clock(self) -> None:
+        if self.clock_status in {"ok", "within_noise"} and self._clock_expired():
+            self.clock_status = "uncalibrated"
+            self.clock_offset_ms = None
+            self.clock_rtt_ms = None
+            self.clock_uncertainty_ms = None
+            self.clock_server_ms = None
+            self.clock_error = "clock_sample_expired"
+            self._clock_mono = None
+
     def clock_blocks_trading(self) -> bool:
-        return self.clock_status == "shifted"
+        self._expire_clock()
+        return self.clock_status not in {"ok", "within_noise"}
+
+    def tradable_snap(self) -> TickerSnap | None:
+        """A snapshot may price a fill only while the socket is up and subscribed.
+
+        ``max_quote_age_seconds`` is measured with ``time.monotonic`` from the
+        moment this process accepted the message. A disconnected socket or an
+        unconfirmed subscription cannot keep using the cache.
+        """
+        if self.clock_blocks_trading():
+            return None
+        if self.connection != "connected" or self.subscription != "subscribed":
+            return None
+        snap = self._snap
+        if snap is None or snap.received_mono <= 0:
+            return None
+        age = time.monotonic() - snap.received_mono
+        if age > self.settings.max_quote_age_seconds:
+            return None
+        return snap
 
     def set_clock(self, status: str, offset_ms: int | None, rtt_ms: int | None, uncertainty_ms: int | None, server_ms: int | None) -> None:
         self.clock_status = status
@@ -80,18 +119,27 @@ class PublicTickerFeed:
         self.clock_uncertainty_ms = uncertainty_ms
         self.clock_server_ms = server_ms
         self.clock_error = ""
+        self._clock_mono = time.monotonic()
 
     def set_clock_failed(self, reason: str) -> None:
+        self.clock_status = "uncalibrated"
+        self.clock_offset_ms = None
+        self.clock_rtt_ms = None
+        self.clock_uncertainty_ms = None
+        self.clock_server_ms = None
+        self._clock_mono = None
         self.clock_error = reason[:80]
-        if self.clock_offset_ms is None:
-            self.clock_status = "failed"
 
     def note_trade(self, source: str, note: str) -> None:
         self.trade_source = source
         self.trade_note = note[:80]
 
     def view(self) -> dict[str, Any]:
+        self._expire_clock()
         snap = self._snap
+        quote_age_ms = None
+        if snap is not None and snap.received_mono > 0:
+            quote_age_ms = int((time.monotonic() - snap.received_mono) * 1000)
         intervals = list(self._intervals)
         return {
             "url": self.url,
@@ -108,6 +156,8 @@ class PublicTickerFeed:
             "future": self.future,
             "server_ts_ms": None if snap is None else snap.server_ts_ms,
             "received_at_ms": None if snap is None else snap.received_at_ms,
+            "quote_age_ms": quote_age_ms,
+            "tradable": self.tradable_snap() is not None,
             "arrival_minus_server_ms": None if snap is None else snap.received_at_ms - snap.server_ts_ms,
             "last_price": None if snap is None else format(snap.last, "f"),
             "bid": None if snap is None else format(snap.bid, "f"),
@@ -131,10 +181,29 @@ class PublicTickerFeed:
             "poll_seconds": self.settings.poll_seconds,
         }
 
+    def _stopping(self, external_stop: asyncio.Event | None) -> bool:
+        return self._stop.is_set() or (external_stop is not None and external_stop.is_set())
+
+    def _quiet_close(self, exc: BaseException, external_stop: asyncio.Event | None) -> bool:
+        if self._stopping(external_stop):
+            return True
+        return type(exc).__name__ in {"ConnectionClosedOK", "ConnectionClosed"} and self._stopping(external_stop)
+
     async def run(self, external_stop: asyncio.Event | None = None) -> None:
         self._task = asyncio.current_task()
+        if self._connector is _live_connector:
+            try:
+                import websockets  # noqa: F401
+            except ImportError as exc:
+                self.dependency_missing = True
+                self.connection = "dependency_missing"
+                self.subscription = "none"
+                self.subscribe_error = "websockets_missing"
+                raise BitgetPaperConfigError(
+                    "websockets_missing: install websockets in this environment, or set public_ws_enabled false to stay on REST"
+                ) from exc
         attempt = 0
-        while not self._stop.is_set() and (external_stop is None or not external_stop.is_set()):
+        while not self._stopping(external_stop):
             try:
                 self.connection = "connecting"
                 self.subscription = "pending"
@@ -146,26 +215,34 @@ class PublicTickerFeed:
                     attempt = 0
             except asyncio.CancelledError:
                 raise
+            except BitgetPaperConfigError:
+                raise
             except Exception as exc:
-                if self._stop.is_set():
+                if self._quiet_close(exc, external_stop):
+                    break
+                if isinstance(exc, ModuleNotFoundError):
+                    self.dependency_missing = True
+                    self.subscribe_error = "websockets_missing"
+                    self.connection = "dependency_missing"
                     break
                 self.subscribe_error = exc.reason if isinstance(exc, QuoteRejected) else type(exc).__name__
                 if isinstance(exc, QuoteRejected) and exc.reason == "subscribe_rejected":
                     self.subscription = "error"
             finally:
                 self._ws = None
-                if self.connection != "stopping":
+                if self.connection not in {"stopping", "dependency_missing"}:
                     self.connection = "disconnected"
                 if self.subscription != "error":
                     self.subscription = "none"
-            if self._stop.is_set() or (external_stop is not None and external_stop.is_set()):
+            if self._stopping(external_stop) or self.dependency_missing:
                 break
             self.reconnects += 1
             delay = min(self.settings.ws_reconnect_max_seconds, 2 ** min(attempt, 5))
             delay = delay * (0.5 + self._rng.random() * 0.5)
             attempt += 1
             await self._sleep(delay, external_stop)
-        self.connection = "disconnected"
+        if self.connection != "dependency_missing":
+            self.connection = "disconnected"
 
     async def stop(self) -> None:
         self.connection = "stopping"
@@ -189,22 +266,22 @@ class PublicTickerFeed:
 
     async def _session(self, ws: Any, external_stop: asyncio.Event | None) -> None:
         await ws.send(_SUBSCRIBE)
-        next_ping = self._now_ms() + self.settings.ws_ping_seconds * 1000
-        pong_deadline: int | None = None
-        while not self._stop.is_set() and (external_stop is None or not external_stop.is_set()):
-            timeout = max(0.05, min(1.0, (next_ping - self._now_ms()) / 1000))
+        next_ping = time.monotonic() + self.settings.ws_ping_seconds
+        pong_deadline: float | None = None
+        while not self._stopping(external_stop):
+            timeout = max(0.05, min(1.0, next_ping - time.monotonic()))
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout)
             except asyncio.TimeoutError:
-                now_ms = self._now_ms()
-                if pong_deadline is not None and now_ms > pong_deadline:
+                now_mono = time.monotonic()
+                if pong_deadline is not None and now_mono > pong_deadline:
                     self.heartbeat = "late"
                     raise QuoteRejected("pong_timeout")
-                if now_ms >= next_ping:
+                if now_mono >= next_ping:
                     await ws.send("ping")
-                    self._ping_sent_ms = now_ms
-                    pong_deadline = now_ms + self.settings.ws_pong_timeout_seconds * 1000
-                    next_ping = now_ms + self.settings.ws_ping_seconds * 1000
+                    self._ping_sent_ms = self._now_ms()
+                    pong_deadline = now_mono + self.settings.ws_pong_timeout_seconds
+                    next_ping = now_mono + self.settings.ws_ping_seconds
                     self.heartbeat = "waiting"
                 continue
             if isinstance(raw, bytes):
@@ -299,11 +376,6 @@ class PublicTickerFeed:
             self.rejected += 1
             return
         now_ms = self._now_ms()
-        skew_ms = self.settings.clock_skew_seconds * 1000
-        if server_ts > now_ms + skew_ms:
-            self.future += 1
-            self.rejected += 1
-            return
         if self._last_server_ts is not None and server_ts < self._last_server_ts:
             self.disorder += 1
             self.rejected += 1
@@ -314,7 +386,7 @@ class PublicTickerFeed:
         if self._last_server_ts is not None:
             self._intervals.append(server_ts - self._last_server_ts)
         self._last_server_ts = server_ts
-        self._snap = TickerSnap(bid, ask, last, bid_size, ask_size, server_ts, now_ms)
+        self._snap = TickerSnap(bid, ask, last, bid_size, ask_size, server_ts, now_ms, time.monotonic())
         self.accepted += 1
 
     def _now_ms(self) -> int:
@@ -340,12 +412,23 @@ class PublicTickerFeed:
             ext_wait.cancel()
 
 
+def require_websockets() -> None:
+    """Fail before any reconnect loop when this environment cannot open a socket."""
+    try:
+        import websockets  # noqa: F401
+    except ImportError as exc:
+        raise BitgetPaperConfigError(
+            "websockets_missing: install websockets in this environment, or set public_ws_enabled false to stay on REST"
+        ) from exc
+
+
 async def diagnose_stream(settings: BitgetPaperSettings, seconds: int) -> dict[str, Any]:
     """Read the public stream for a bounded time. Does not open the ledger or place a fill."""
     from datetime import datetime, timezone
 
     from .market import PublicMarketClient
 
+    require_websockets()
     feed = PublicTickerFeed(settings)
     stop = asyncio.Event()
     task = asyncio.create_task(feed.run(stop))
