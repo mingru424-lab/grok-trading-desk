@@ -441,11 +441,13 @@ async def test_emergency_stop_does_not_wait_for_the_network(tmp_path):
 def test_second_os_process_cannot_take_the_book_lock(tmp_path):
     import subprocess
     import sys
+    from pathlib import Path
     from src.bitget_paper.store import BookLock, lock_path_for
     path = lock_path_for(tmp_path / "state.json")
+    repo_root = Path(__file__).resolve().parents[1]
     holder = subprocess.Popen(
         [sys.executable, "-c", "import sys,time\nfrom pathlib import Path\nfrom src.bitget_paper.store import BookLock\nlock=BookLock(Path(sys.argv[1]))\nlock.acquire()\nprint('held', flush=True)\ntime.sleep(20)\n", str(path)],
-        cwd="/agent/repos/grok-trading-desk",
+        cwd=repo_root,
         stdout=subprocess.PIPE,
         text=True,
     )
